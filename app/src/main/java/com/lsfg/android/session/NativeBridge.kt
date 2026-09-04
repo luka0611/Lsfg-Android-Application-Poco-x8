@@ -187,6 +187,15 @@ object NativeBridge {
      * per-frame cross-device vkDeviceWaitIdle — measured at roughly half of total
      * frame time — without also changing framegen to use Android's native SYNC_FD.
      */
+    /**
+     * Why framegen is or is not producing frames, matching the native worker's
+     * `runFramegen` predicate: 0 active, 1 no context, 2 bypassed by the user toggle,
+     * 3 auto-disabled after VK_ERROR_DEVICE_LOST. Both the generated-frame counter and
+     * the frame profile only advance while it is 0, so a report showing zero generated
+     * frames is ambiguous without this.
+     */
+    external fun getFramegenState(): Int
+
     external fun getExternalSemaphoreSupport(): Int
 
     external fun getProfileWindowNs(out: LongArray): Int

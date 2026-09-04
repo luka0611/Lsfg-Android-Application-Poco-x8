@@ -206,6 +206,12 @@ Java_com_lsfg_android_session_NativeBridge_getUniqueCaptureCount(
 }
 
 extern "C" JNIEXPORT jint JNICALL
+Java_com_lsfg_android_session_NativeBridge_getFramegenState(
+        JNIEnv * /*env*/, jobject /*thiz*/) {
+    return static_cast<jint>(lsfg_android::getFramegenState());
+}
+
+extern "C" JNIEXPORT jint JNICALL
 Java_com_lsfg_android_session_NativeBridge_getExternalSemaphoreSupport(
         JNIEnv * /*env*/, jobject /*thiz*/) {
     return static_cast<jint>(lsfg_android::externalSemaphoreOpaqueFdSupport());

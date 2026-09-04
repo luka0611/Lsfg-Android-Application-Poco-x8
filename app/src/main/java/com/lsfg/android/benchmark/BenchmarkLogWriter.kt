@@ -64,6 +64,7 @@ object BenchmarkLogWriter {
         // to move off OPAQUE_FD onto Android's native SYNC_FD first. Reported here so
         // answering that needs the benchmark, not a logcat capture.
         sb.appendLine("ext_semaphore    = ${extSemaphoreLabel()}")
+        sb.appendLine("framegen_state   = ${framegenStateLabel()}")
         sb.appendLine()
 
         sb.appendLine("[session]")
@@ -167,6 +168,20 @@ object BenchmarkLogWriter {
         val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
         return fmt.format(Date(ms))
     }
+
+    /**
+     * Why framegen did or did not run. Zero generated frames plus a frozen frame profile
+     * is the same report for a missing context, a user bypass and a lost device, so name
+     * which it was.
+     */
+    private fun framegenStateLabel(): String =
+        when (runCatching { NativeBridge.getFramegenState() }.getOrDefault(-1)) {
+            0 -> "active"
+            1 -> "NO CONTEXT — framegen never initialised (shaders/DLL or init failure)"
+            2 -> "BYPASSED — the LSFG Frame Gen master toggle is off"
+            3 -> "AUTO-DISABLED — VK_ERROR_DEVICE_LOST during presentContext"
+            else -> "unknown (native call failed)"
+        }
 
     /** Renders NativeBridge.getExternalSemaphoreSupport()'s bitmask as something readable. */
     private fun extSemaphoreLabel(): String {

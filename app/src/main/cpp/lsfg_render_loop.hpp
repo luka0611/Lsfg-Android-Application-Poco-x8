@@ -103,6 +103,11 @@ void pushFrame(AHardwareBuffer *ahb, int64_t timestampNs);
 void shutdownRenderLoop();
 
 // Counter for the FPS overlay. Returns 0 before init / after shutdown.
+/// Why framegen is or is not producing frames, matching workerThread's runFramegen
+/// predicate: 0 active, 1 no context, 2 bypassed by the user toggle, 3 auto-disabled
+/// after VK_ERROR_DEVICE_LOST.
+int getFramegenState();
+
 uint64_t getGeneratedFrameCount();
 
 // Total frames actually posted to the overlay surface (CPU blit or WSI

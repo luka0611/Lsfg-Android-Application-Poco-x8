@@ -2673,6 +2673,18 @@ void shutdownRenderLoop() {
     LOGI("Render loop shut down");
 }
 
+int getFramegenState() {
+    // Mirrors the `runFramegen` predicate in workerThread. generatedFrames and the
+    // frame profile are both accumulated inside that branch, so when it is false the
+    // benchmark reports zero generated frames and a frozen profile snapshot with no
+    // indication of which of the three causes applied. Report the cause instead of
+    // making it a logcat-only question.
+    if (g.framegenCtxId < 0) return 1;                                        // no context
+    if (g.bypass.load(std::memory_order_relaxed)) return 2;                   // user bypass
+    if (g.framegenAutoDisabled.load(std::memory_order_relaxed)) return 3;     // DEVICE_LOST
+    return 0;                                                                 // active
+}
+
 uint64_t getGeneratedFrameCount() {
     return g.generatedFrames.load(std::memory_order_relaxed);
 }
