@@ -5,7 +5,9 @@ import android.content.Intent
 import android.os.Build
 import android.view.WindowManager
 import androidx.core.content.FileProvider
+import java.io.RandomAccessFile
 import com.lsfg.android.session.CaptureDiagnostics
+import com.lsfg.android.session.LsfgLog
 import com.lsfg.android.BuildConfig
 import com.lsfg.android.session.NativeBridge
 import java.io.File
@@ -137,7 +139,39 @@ object BenchmarkLogWriter {
             sb.appendLine()
         }
 
+        sb.appendLine("[log tail]")
+        sb.appendLine(logTail())
+        sb.appendLine()
+
         return sb.toString()
+    }
+
+    /**
+     * Last lines of filesDir/lsfg.log.
+     *
+     * The Kotlin side already logs the whole session setup — which capture source was
+     * chosen, whether a target package was resolved, whether the privileged capture was
+     * ever started — but none of it was reachable without adb, so diagnosing a session
+     * that captured nothing meant guessing which single value to surface next and
+     * shipping a build for each guess. Attaching the tail gives the whole sequence at
+     * once.
+     *
+     * Read from the end so a large file costs nothing.
+     */
+    private fun logTail(maxLines: Int = 200, windowBytes: Long = 96 * 1024): String {
+        val f = LsfgLog.logFile() ?: return "(no log file)"
+        return runCatching {
+            RandomAccessFile(f, "r").use { raf ->
+                val start = (raf.length() - windowBytes).coerceAtLeast(0L)
+                raf.seek(start)
+                val bytes = ByteArray((raf.length() - start).toInt())
+                raf.readFully(bytes)
+                val text = String(bytes, Charsets.UTF_8)
+                // A mid-line start is likely when seeking into the middle of the file.
+                val lines = text.lineSequence().drop(if (start > 0L) 1 else 0).toList()
+                lines.takeLast(maxLines).joinToString("\n").ifBlank { "(log empty)" }
+            }
+        }.getOrElse { "(log unreadable: ${it.javaClass.simpleName})" }
     }
 
     /**
