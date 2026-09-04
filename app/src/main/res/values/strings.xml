@@ -94,6 +94,8 @@
     <string name="param_hdr_desc">Enable only if your device and game output HDR.</string>
     <string name="param_anti_artifacts">Anti-artifacts Mode</string>
     <string name="param_anti_artifacts_desc">Suppress generated frames during very fast camera movement to reduce missing character parts and warping. Off by default.</string>
+    <string name="param_gpu_sync">GPU Sync</string>
+    <string name="param_gpu_sync_desc">Wait for each generated frame on the GPU instead of blocking the CPU after every frame-gen pass. Falls back automatically on devices that can\'t import Android sync fences. On by default; turn off to compare.</string>
     <string name="param_framegen_fp16">FP16 frame-gen shaders</string>
     <string name="param_framegen_fp16_desc">Use the half-precision shader variants pre-compiled inside Lossless.dll instead of the full-precision DXBC set. Reduces GPU load and memory bandwidth. Quality is virtually identical; falls back to FP32 automatically if anything goes wrong.</string>
     <string name="param_npu_post">NPU image enhancement</string>

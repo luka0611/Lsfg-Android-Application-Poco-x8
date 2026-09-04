@@ -23,6 +23,17 @@ data class LsfgConfig(
     val hdrMode: Boolean,
     val antiArtifacts: Boolean,
     /**
+     * Cross-device synchronisation strategy for framegen's separate VkDevice.
+     *
+     * On (default): framegen exports an Android sync fd per generated frame and the
+     * blits wait on the GPU, so its passes overlap the blits and the pacing sleeps.
+     * Off: the render loop blocks in `vkDeviceWaitIdle` after every present — the
+     * original behaviour, measured at roughly half of total frame time on Mali-G720.
+     * Kept as a switch because the fast path depends on driver support for importing
+     * SYNC_FD semaphores, and because it is the one knob worth A/B-ing on a new device.
+     */
+    val gpuSync: Boolean,
+    /**
      * When true, the render loop loads the precompiled SPIR-V FP16 shader
      * variants from Lossless.dll (resource IDs 304..351) instead of
      * translating the DXBC FP32 set (255..302) via dxvk. Requires
@@ -272,6 +283,7 @@ class LsfgPreferences(ctx: Context) {
         performanceMode = prefs.getBoolean(KEY_PERF, true),
         hdrMode = prefs.getBoolean(KEY_HDR, false),
         antiArtifacts = prefs.getBoolean(KEY_ANTI_ARTIFACTS, false),
+        gpuSync = prefs.getBoolean(KEY_GPU_SYNC, true),
         framegenFp16 = prefs.getBoolean(KEY_FRAMEGEN_FP16, false),
         targetPackage = prefs.getString(KEY_TARGET, null),
         captureSource = CaptureSource.fromPref(prefs.getString(KEY_CAPTURE_SOURCE, null)),
@@ -340,6 +352,7 @@ class LsfgPreferences(ctx: Context) {
     fun setPerformance(value: Boolean) = prefs.edit().putBoolean(KEY_PERF, value).apply()
     fun setHdr(value: Boolean) = prefs.edit().putBoolean(KEY_HDR, value).apply()
     fun setAntiArtifacts(value: Boolean) = prefs.edit().putBoolean(KEY_ANTI_ARTIFACTS, value).apply()
+    fun setGpuSync(value: Boolean) = prefs.edit().putBoolean(KEY_GPU_SYNC, value).apply()
     fun setFramegenFp16(value: Boolean) = prefs.edit().putBoolean(KEY_FRAMEGEN_FP16, value).apply()
     fun setTargetPackage(pkg: String?) = prefs.edit().putString(KEY_TARGET, pkg).apply()
     fun setCaptureSource(value: CaptureSource) = prefs.edit()
@@ -418,6 +431,7 @@ class LsfgPreferences(ctx: Context) {
         private const val KEY_PERF = "performance"
         private const val KEY_HDR = "hdr"
         private const val KEY_ANTI_ARTIFACTS = "anti_artifacts"
+        private const val KEY_GPU_SYNC = "gpu_sync"
         private const val KEY_FRAMEGEN_FP16 = "framegen_fp16"
         private const val KEY_TARGET = "target_pkg"
         private const val KEY_CAPTURE_SOURCE = "capture_source"

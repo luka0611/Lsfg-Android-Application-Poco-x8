@@ -216,6 +216,22 @@ Java_com_lsfg_android_session_NativeBridge_getImportCacheStats(
     env->SetLongArrayRegion(out, 0, 2, vals);
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_lsfg_android_session_NativeBridge_getGpuSyncStats(
+        JNIEnv *env, jobject /*thiz*/, jlongArray out) {
+    if (out == nullptr || env->GetArrayLength(out) < 3) return;
+    uint64_t syncFrames = 0;
+    uint64_t fallbacks = 0;
+    int64_t retireWaitNs = 0;
+    lsfg_android::getGpuSyncStats(&syncFrames, &fallbacks, &retireWaitNs);
+    jlong vals[3] = {
+        static_cast<jlong>(syncFrames),
+        static_cast<jlong>(fallbacks),
+        static_cast<jlong>(retireWaitNs),
+    };
+    env->SetLongArrayRegion(out, 0, 3, vals);
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_lsfg_android_session_NativeBridge_getFramegenState(
         JNIEnv * /*env*/, jobject /*thiz*/) {
@@ -286,6 +302,12 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_lsfg_android_session_NativeBridge_setAntiArtifacts(
         JNIEnv * /*env*/, jobject /*thiz*/, jboolean enabled) {
     lsfg_android::setAntiArtifacts(enabled == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_lsfg_android_session_NativeBridge_setGpuSync(
+        JNIEnv * /*env*/, jobject /*thiz*/, jboolean enabled) {
+    lsfg_android::setGpuSync(enabled == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT void JNICALL

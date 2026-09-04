@@ -113,6 +113,13 @@ void getImportCacheStats(uint64_t *hits, uint64_t *misses);
 
 int getFramegenState();
 
+/// Counters for the sync-fd cross-device path. `syncFrames` presents that waited on
+/// framegen's exported Android sync fds, `fallbacks` presents that used the blocking
+/// LSFG_3_X::waitIdle() instead, `retireWaitNs` the cumulative CPU time spent in the
+/// deferred input-retire poll. On a device where the path works, fallbacks stays at
+/// zero after the first frame and retireWaitNs stays near zero in the steady state.
+void getGpuSyncStats(uint64_t *syncFrames, uint64_t *fallbacks, int64_t *retireWaitNs);
+
 uint64_t getGeneratedFrameCount();
 
 // Total frames actually posted to the overlay surface (CPU blit or WSI
@@ -149,6 +156,13 @@ void setBypass(bool bypass);
 
 // Toggle suppression of generated frames for high-delta frame pairs.
 void setAntiArtifacts(bool enabled);
+
+// Toggle the sync-fd cross-device path. On, each blit waits for its generated
+// frame on the GPU and the CPU never blocks on framegen; off, every present is
+// followed by a blocking vkDeviceWaitIdle on framegen's device (the original
+// behaviour). Exposed as a switch so the two can be A/B'd on a live session.
+// Safe to call from any thread.
+void setGpuSync(bool enabled);
 
 // Report the display's vsync period in nanoseconds (e.g. 16_666_666 for a
 // 60 Hz display, 8_333_333 for 120 Hz). When set to a positive value the

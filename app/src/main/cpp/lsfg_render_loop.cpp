@@ -30,6 +30,9 @@
 #include <vector>
 #include <unordered_map>
 #include <dlfcn.h>
+#include <cerrno>
+#include <poll.h>
+#include <unistd.h>
 
 #include "crash_reporter.hpp"
 
@@ -307,6 +310,39 @@ struct State {
     std::atomic<int64_t> outlierRatioMicro{4000000}; // ratio * 1e6, default 4.0
     std::atomic<int64_t> vsyncSlackNs{2'000'000};    // default 2 ms
     std::atomic<int> queueDepth{4};
+
+    // ---- GPU cross-device sync (Android sync fds) --------------------------
+    //
+    // Framegen and this session run on separate VkDevices, so historically the
+    // worker called LSFG_3_X::waitIdle() after every presentContext: a full
+    // vkDeviceWaitIdle on framegen's device, blocking this thread until every
+    // generated frame was done. Profiling on Mali-G720 put it at 14.5 ms of a
+    // 29.9 ms frame at 2x and 28.5 ms of 68.6 ms at 4x — about half of all
+    // frame time, with both devices serialised and neither overlapping.
+    //
+    // Framegen now signals one semaphore per generated frame and exports it as
+    // an Android sync fd (getOutputSyncFds). We import each fd here and let the
+    // blit wait on it *on the GPU*, so the CPU never blocks: framegen's passes
+    // overlap our blits and the pacing sleeps instead of preceding them.
+    //
+    // Two waits are needed, not one:
+    //   - output i is ready when pass i's fd signals  -> GPU wait in the blit
+    //   - the input AHBs are free once the LAST pass signals (it carries their
+    //     release barrier) -> CPU poll() on a dup of that fd, deferred to just
+    //     before the next input copy overwrites them.
+    std::atomic<bool> gpuSyncEnabled{true};   // user toggle (drawer / params)
+    std::atomic<bool> gpuSyncUsable{true};    // cleared for the session on failure
+    std::atomic<uint64_t> gpuSyncFrames{0};   // presents that took the sync-fd path
+    std::atomic<uint64_t> gpuSyncFallbacks{0};// presents that fell back to waitIdle
+    std::atomic<int64_t> gpuSyncRetireWaitNs{0};  // CPU time in the deferred input wait
+    std::atomic<bool> gpuSyncLoggedFallback{false};
+    // Reused every frame. A SYNC_FD import is always temporary, so each
+    // semaphore reverts to its (unsignalled) permanent payload as soon as the
+    // wait completes and can be imported into again next frame.
+    std::vector<VkSemaphore> outputSyncSems;
+    // dup() of the last pass's fd, owned by us until awaitPendingInputRetire
+    // polls and closes it. -1 when nothing is pending.
+    int pendingRetireFd = -1;
 };
 
 State g{};
@@ -436,6 +472,92 @@ bool gpuWantsPreLsfg() {
 
 bool gpuWantsPostLsfg() {
     return g.gpuPostProcessing && g.gpuStage != 0;
+}
+
+// ---- GPU cross-device sync helpers -------------------------------------------
+
+// How long to wait for framegen's last pass before giving up on the sync-fd
+// path. Generous: a present that takes this long is already catastrophic, and
+// the point of the timeout is only that a wedged framegen device cannot wedge
+// the render thread the way waitIdle() would.
+constexpr int kRetireWaitTimeoutMs = 500;
+
+// Block until `fd` signals. Android sync fds are pollable and POLLIN fires on
+// signal, which is the documented public way to wait on one — sync_wait() is
+// not in the NDK. Returns false on timeout or error.
+bool waitSyncFdSignalled(int fd, int timeoutMs) {
+    if (fd < 0) return false;
+    struct pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
+    for (;;) {
+        const int r = ::poll(&pfd, 1, timeoutMs);
+        if (r > 0) return (pfd.revents & (POLLERR | POLLNVAL)) == 0;
+        if (r == 0) return false;                  // timed out
+        if (errno != EINTR) return false;
+    }
+}
+
+// Import `fd` into `sem` as a temporary SYNC_FD payload. On success the driver
+// takes ownership of the fd; on failure it stays ours to close.
+bool importSyncFdSemaphore(VkSemaphore sem, int fd) {
+    if (g.vk.fn.vkImportSemaphoreFdKHR == nullptr) return false;
+    const VkImportSemaphoreFdInfoKHR info{
+        .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+        .semaphore = sem,
+        // Mandatory for SYNC_FD: the type has no shared payload, so an import
+        // can only ever be temporary.
+        .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+        .fd = fd,
+    };
+    return g.vk.fn.vkImportSemaphoreFdKHR(g.vk.device, &info) == VK_SUCCESS;
+}
+
+// Consume an imported payload with a CPU wait. Only used on the rare paths that
+// cannot express a GPU wait (the CPU blit fallback, GPU post-process), where the
+// pixels are about to be read on the CPU anyway.
+void drainSemaphoreOnCpu(VkSemaphore sem) {
+    if (sem == VK_NULL_HANDLE || g.vk.device == VK_NULL_HANDLE) return;
+    VkFence fence = VK_NULL_HANDLE;
+    const VkFenceCreateInfo fi{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (g.vk.fn.vkCreateFence(g.vk.device, &fi, nullptr, &fence) != VK_SUCCESS) return;
+    const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    const VkSubmitInfo si{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &sem,
+        .pWaitDstStageMask = &stage,
+    };
+    if (g.vk.fn.vkQueueSubmit(g.vk.computeQueue, 1, &si, fence) == VK_SUCCESS) {
+        g.vk.fn.vkWaitForFences(g.vk.device, 1, &fence, VK_TRUE,
+                                static_cast<uint64_t>(kRetireWaitTimeoutMs) * 1'000'000ULL);
+    }
+    g.vk.fn.vkDestroyFence(g.vk.device, fence, nullptr);
+}
+
+bool ensureOutputSyncSemaphores(size_t count) {
+    while (g.outputSyncSems.size() < count) {
+        VkSemaphore sem = VK_NULL_HANDLE;
+        const VkSemaphoreCreateInfo ci{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        if (g.vk.fn.vkCreateSemaphore(g.vk.device, &ci, nullptr, &sem) != VK_SUCCESS) {
+            LOGW("GPU sync: vkCreateSemaphore failed — using waitIdle for this session");
+            return false;
+        }
+        g.outputSyncSems.push_back(sem);
+    }
+    return true;
+}
+
+void destroyOutputSyncSemaphores() {
+    if (g.vk.device != VK_NULL_HANDLE && g.vk.fn.vkDestroySemaphore != nullptr) {
+        for (VkSemaphore s : g.outputSyncSems) {
+            if (s != VK_NULL_HANDLE) g.vk.fn.vkDestroySemaphore(g.vk.device, s, nullptr);
+        }
+    }
+    g.outputSyncSems.clear();
+    if (g.pendingRetireFd >= 0) {
+        ::close(g.pendingRetireFd);
+        g.pendingRetireFd = -1;
+    }
 }
 
 void noteGpuShaderPassPending() {
@@ -908,7 +1030,12 @@ bool createSwapchain() {
 // Blit `src` AHB-backed VkImage to the next swapchain image and present.
 // Returns true on success. On VK_ERROR_OUT_OF_DATE_KHR or _SUBOPTIMAL_KHR the
 // swapchain is marked dirty; the caller's next blit will recreate it.
-bool blitOutputToSwapchain(const AhbImage &src) {
+//
+// `gpuWait`, when set, is a semaphore carrying framegen's imported sync fd for
+// exactly this output. Waiting on it here is the whole point of the sync-fd
+// path: the submit is queued immediately and the GPU stalls on the fence, so
+// the CPU is free to pace and issue the next blit meanwhile.
+bool blitOutputToSwapchain(const AhbImage &src, VkSemaphore gpuWait = VK_NULL_HANDLE) {
     // Note: Called with g.mu held from blitOutputToWindow.
     if (g.swap.swapchain == VK_NULL_HANDLE) return false;
     if (src.image == VK_NULL_HANDLE) return false;
@@ -1053,12 +1180,20 @@ bool blitOutputToSwapchain(const AhbImage &src) {
     g.vk.fn.vkEndCommandBuffer(cb);
 
     VkSemaphore renderSem = g.swap.renderSems[imageIdx];
-    const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    // The framegen wait is ALL_COMMANDS rather than TRANSFER: the source
+    // ownership-acquire barrier above is recorded at TOP_OF_PIPE, so nothing in
+    // this command buffer may start before framegen's pass has retired.
+    VkSemaphore waitSems[2] = {acquireSem, gpuWait};
+    const VkPipelineStageFlags waitStages[2] = {
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+    };
+    const uint32_t waitCount = gpuWait != VK_NULL_HANDLE ? 2u : 1u;
     const VkSubmitInfo si{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &acquireSem,
-        .pWaitDstStageMask = &waitStage,
+        .waitSemaphoreCount = waitCount,
+        .pWaitSemaphores = waitSems,
+        .pWaitDstStageMask = waitStages,
         .commandBufferCount = 1,
         .pCommandBuffers = &cb,
         .signalSemaphoreCount = 1,
@@ -1427,6 +1562,135 @@ bool processRealFrameIntoSlot(const AhbImage &src, const AhbImage &dst) {
     return copyAhbImage(src, dst);
 }
 
+// Can this present use framegen's exported sync fds instead of waitIdle()?
+//
+// The gate is deliberately narrow. Only the WSI swapchain blit has a submit we
+// can hang a semaphore wait on; every other output path reads the pixels on the
+// CPU, where waiting on a fence costs what waitIdle() already costs, so there is
+// nothing to win and a second code path to get wrong.
+bool gpuSyncViable() {
+    if (!g.gpuSyncEnabled.load(std::memory_order_relaxed)) return false;
+    if (!g.gpuSyncUsable.load(std::memory_order_relaxed)) return false;
+    if (g.outputs.empty()) return false;
+    if (g.vk.device == VK_NULL_HANDLE || g.vk.fn.vkImportSemaphoreFdKHR == nullptr) return false;
+    // bit1 = VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT. Mali-G720 reports 3
+    // (exportable | importable) for SYNC_FD and 0 for OPAQUE_FD, which is why
+    // the direction had to be inverted in the first place.
+    if ((externalSemaphoreSyncFdSupport() & 2) == 0) return false;
+    if (!kEnableWsiSwapchain || !g.vk.hasSwapchain || g.swap.disabledForSession) return false;
+    if (g.npuPostProcessing || g.cpuPostProcessing) return false;
+    if (gpuWantsPostLsfg()) return false;
+    return true;
+}
+
+// Take ownership of framegen's exported fds, import them into our reusable
+// semaphores, and stash a dup of the last one for the deferred input wait.
+//
+// Returns false — with every fd closed and nothing armed — if anything is off,
+// in which case the caller must fall back to waitIdle() for this present.
+//
+// Re-importing into a semaphore requires it to have no queue command pending on
+// it. That holds because processRealFrameIntoSlot, on all three of its paths,
+// ends in vkQueueWaitIdle(computeQueue), and it runs earlier in this same worker
+// iteration than the import below — so the previous frame's blits have retired.
+bool adoptOutputSyncFds(std::vector<int> &fds, std::vector<VkSemaphore> &outWaits,
+                        VkSemaphore &realFrameWait) {
+    outWaits.clear();
+    realFrameWait = VK_NULL_HANDLE;
+    const size_t n = fds.size();
+    // Every failure below is structural on a given device — the extension is
+    // missing, the driver refuses the import, the counts don't line up — so latch
+    // the path off for the session rather than re-testing it on every present.
+    // Flipping the user toggle off and on re-arms it.
+    auto bail = [&fds](int extraFd) {
+        for (int fd : fds) if (fd >= 0) ::close(fd);
+        fds.clear();
+        if (extraFd >= 0) ::close(extraFd);
+        g.gpuSyncUsable.store(false, std::memory_order_relaxed);
+        return false;
+    };
+    if (n == 0) return bail(-1);
+    if (n != g.outputs.size()) {
+        LOGW("GPU sync: framegen returned %zu sync fds for %zu outputs — using waitIdle",
+             n, g.outputs.size());
+        return bail(-1);
+    }
+    for (int fd : fds) {
+        // -1 imports as "already signalled", which would silently drop the
+        // synchronisation instead of providing it. Treat it as a failed export.
+        if (fd < 0) return bail(-1);
+    }
+    // n output semaphores plus one for the real-frame blit (see below).
+    if (!ensureOutputSyncSemaphores(n + 1)) return bail(-1);
+
+    // The semaphore import consumes its fd, but the last pass's fence is needed
+    // three times over, so take two more handles on it:
+    //
+    //   - retireFd  gates the next input copy (CPU poll)
+    //   - realFd    gates the blit of the real capture. That blit reads an input
+    //               AHB and does a queue-family ownership transfer on it, and
+    //               the last pass carries framegen's matching release barrier —
+    //               so the two must not overlap. waitIdle() used to order them
+    //               implicitly.
+    const int retireFd = ::dup(fds.back());
+    const int realFd = retireFd >= 0 ? ::dup(fds.back()) : -1;
+    if (retireFd < 0 || realFd < 0) {
+        LOGW("GPU sync: dup() of the output fence failed (%s) — using waitIdle",
+             std::strerror(errno));
+        if (retireFd >= 0) ::close(retireFd);
+        if (realFd >= 0) ::close(realFd);
+        return bail(-1);
+    }
+    if (!importSyncFdSemaphore(g.outputSyncSems[n], realFd)) {
+        LOGW("GPU sync: vkImportSemaphoreFdKHR failed on the real-frame fence — using waitIdle");
+        ::close(realFd);
+        return bail(retireFd);
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        if (!importSyncFdSemaphore(g.outputSyncSems[i], fds[i])) {
+            LOGW("GPU sync: vkImportSemaphoreFdKHR failed on pass %zu — using waitIdle", i);
+            // Semaphores 0..i-1 keep an imported payload nobody will wait on.
+            // That is harmless: no queue command references them, so the next
+            // frame's import replaces the payload outright.
+            for (size_t j = 0; j < i; ++j) fds[j] = -1;  // already owned by the driver
+            drainSemaphoreOnCpu(g.outputSyncSems[n]);   // real-frame payload, unused now
+            return bail(retireFd);
+        }
+    }
+    fds.clear();  // ownership of every fd transferred to the driver
+    if (g.pendingRetireFd >= 0) ::close(g.pendingRetireFd);  // never happens; belt and braces
+    g.pendingRetireFd = retireFd;
+    outWaits.reserve(n);
+    for (size_t i = 0; i < n; ++i) outWaits.push_back(g.outputSyncSems[i]);
+    realFrameWait = g.outputSyncSems[n];
+    return true;
+}
+
+// Gate the next input copy on framegen's last pass, which carries the release
+// barrier for both input AHBs. Deferring it to here — rather than doing it
+// right after presentContext, as waitIdle() did — is what lets framegen's work
+// overlap our blits and pacing sleeps. In the steady state the fence is long
+// signalled by the time we get here and this returns immediately.
+void awaitPendingInputRetire() {
+    const int fd = g.pendingRetireFd;
+    if (fd < 0) return;
+    g.pendingRetireFd = -1;
+    const auto t0 = State::Clock::now();
+    const bool ok = waitSyncFdSignalled(fd, kRetireWaitTimeoutMs);
+    ::close(fd);
+    g.gpuSyncRetireWaitNs.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            State::Clock::now() - t0).count(),
+        std::memory_order_relaxed);
+    if (!ok) {
+        LOGW("GPU sync: framegen's output fence did not signal within %d ms — "
+             "reverting to waitIdle() for the rest of this session",
+             kRetireWaitTimeoutMs);
+        g.gpuSyncUsable.store(false, std::memory_order_relaxed);
+    }
+}
+
 bool initFramegen(const char *cacheDir) {
     const std::string cache(cacheDir ? cacheDir : "");
 
@@ -1607,10 +1871,24 @@ bool createFramegenContext() {
 //
 // GPU post-process (when enabled) runs into g.gpuPostImage via a compute
 // shader first, then THAT AHB goes through either path above.
-void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true) {
-    if (g.outWindow == nullptr || out.ahb == nullptr) return;
+void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true,
+                        VkSemaphore gpuWait = VK_NULL_HANDLE) {
+    if (g.outWindow == nullptr || out.ahb == nullptr) {
+        if (gpuWait != VK_NULL_HANDLE) drainSemaphoreOnCpu(gpuWait);
+        return;
+    }
 
     if (allowGpuPost && gpuWantsPostLsfg()) {
+        // The post-process shader reads `out` through its own submit, which has
+        // no wait slot for our semaphore. gpuSyncViable() keeps this path off
+        // the sync-fd route, so this is defensive only. Clear the handle after
+        // draining: the payload is consumed, and waiting on it again further
+        // down (this branch falls through when the shader pass fails) would
+        // block forever.
+        if (gpuWait != VK_NULL_HANDLE) {
+            drainSemaphoreOnCpu(gpuWait);
+            gpuWait = VK_NULL_HANDLE;
+        }
         noteGpuShaderPassPending();
         const uint32_t scaledW = std::max<uint32_t>(
             1, static_cast<uint32_t>(std::lround(out.extent.width * g.gpuUpscaleFactor)));
@@ -1646,13 +1924,14 @@ void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true) {
             if (!createSwapchain()) {
                 // Mark disabled so subsequent blits don't spin on the
                 // failed creation path; use CPU blit for the rest of the
-                // session.
+                // session. The sync-fd path is gated on the swapchain, so
+                // this also takes the next present back to waitIdle().
                 g.swap.disabledForSession = true;
                 LOGI("WSI blit unavailable on this surface — using CPU blit for session");
             }
         }
         if (g.swap.swapchain != VK_NULL_HANDLE) {
-            if (blitOutputToSwapchain(out)) return;
+            if (blitOutputToSwapchain(out, gpuWait)) return;
             // On OUT_OF_DATE we marked swap.outOfDate; next frame triggers
             // the recreate above. No need to fall through — the missed frame
             // costs 16 ms at worst, and forcing a CPU lock now would conflict
@@ -1660,6 +1939,10 @@ void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true) {
             return;
         }
     }
+
+    // CPU blit fallback: the pixels are about to be read through
+    // AHardwareBuffer_lock, so the wait has to happen on this thread.
+    if (gpuWait != VK_NULL_HANDLE) drainSemaphoreOnCpu(gpuWait);
 
     const uint32_t npuScale = g.npuPostProcessing && g.npuUpscaleFactor == 2
         ? 2U
@@ -2002,6 +2285,12 @@ void workerThread() {
             sampleAhb(src.ahb, lbl);
         }
 
+        // On the sync-fd path this is where the previous present's cross-device
+        // wait finally lands: framegen's last pass releases both input AHBs, and
+        // the next line overwrites one of them. No-op when the last present used
+        // waitIdle, or on the first frame.
+        awaitPendingInputRetire();
+
         // Bootstrap: the very first capture has no predecessor, so seed BOTH
         // slots with the same pixels. That makes the optical flow for the first
         // present a no-op (same image on both inputs) and the output equals the
@@ -2080,14 +2369,48 @@ void workerThread() {
             // PROFILE: presentContext returned (CPU-side; the GPU work is
             // still pending on framegen's queue).
             const auto tPresentDone = State::Clock::now();
-            // Wait for framegen's GPU work to actually finish before we (a)
-            // overwrite the input AHB on the next pushFrame and (b) read the
-            // output AHB for the blit. Framegen and our session use different
-            // VkDevices, so vkDeviceWaitIdle on either is necessary — without
-            // an explicit shared semaphore this is the only correct sync.
-            if (g.performanceMode) LSFG_3_1P::waitIdle();
-            else                   LSFG_3_1::waitIdle();
-            // PROFILE: cross-device sync complete; outputs ready to read.
+
+            // Framegen and this session run on different VkDevices, so its GPU
+            // work has to be waited on before we (a) read an output AHB for the
+            // blit and (b) overwrite an input AHB on the next capture.
+            //
+            // Preferred: framegen exports one Android sync fd per generated
+            // frame. Each blit waits on its own fence on the GPU, and (b) is
+            // deferred to awaitPendingInputRetire() at the top of the next
+            // iteration — so framegen's passes overlap our blits and pacing
+            // sleeps instead of running strictly before them.
+            //
+            // Fallback: vkDeviceWaitIdle on framegen's device. Correct, but it
+            // blocks this thread for the full duration of every present.
+            std::vector<VkSemaphore> outputWaits;
+            VkSemaphore realFrameWait = VK_NULL_HANDLE;
+            bool usedGpuSync = false;
+            if (gpuSyncViable()) {
+                std::vector<int> syncFds;
+                try {
+                    syncFds = g.performanceMode
+                        ? LSFG_3_1P::getOutputSyncFds(g.framegenCtxId)
+                        : LSFG_3_1::getOutputSyncFds(g.framegenCtxId);
+                } catch (const std::exception &e) {
+                    LOGW("getOutputSyncFds threw: %s", e.what() != nullptr ? e.what() : "(null)");
+                }
+                usedGpuSync = adoptOutputSyncFds(syncFds, outputWaits, realFrameWait);
+                if (!usedGpuSync && !g.gpuSyncLoggedFallback.exchange(true, std::memory_order_relaxed)) {
+                    LOGW("GPU sync unavailable on this framegen/driver pairing — "
+                         "using waitIdle() for the rest of this session");
+                }
+            }
+            if (usedGpuSync) {
+                g.gpuSyncFrames.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g.gpuSyncFallbacks.fetch_add(1, std::memory_order_relaxed);
+                if (g.performanceMode) LSFG_3_1P::waitIdle();
+                else                   LSFG_3_1::waitIdle();
+            }
+            // PROFILE: cross-device sync complete; outputs ready to read. On the
+            // sync-fd path this segment is the import cost only (microseconds) —
+            // the actual waiting has moved onto the GPU and into
+            // awaitPendingInputRetire().
             const auto tWaitIdleDone = State::Clock::now();
 
             // Note: a previous revision auto-disabled framegen here when the
@@ -2102,9 +2425,10 @@ void workerThread() {
             // calls — excludes pacing sleep_until() time, which is idle, not
             // work. Reset each iteration; consumed by the profile logger below.
             int64_t blitWorkNsThisFrame = 0;
-            auto timedBlit = [&blitWorkNsThisFrame, &pendingFrame, &prof](const AhbImage &out) {
+            auto timedBlit = [&blitWorkNsThisFrame, &pendingFrame, &prof](
+                    const AhbImage &out, VkSemaphore gpuWait = VK_NULL_HANDLE) {
                 const auto t0 = State::Clock::now();
-                blitOutputToWindow(out);
+                blitOutputToWindow(out, /*allowGpuPost*/ true, gpuWait);
                 const auto t1 = State::Clock::now();
                 blitWorkNsThisFrame += std::chrono::duration_cast<
                     std::chrono::nanoseconds>(t1 - t0).count();
@@ -2231,7 +2555,7 @@ void workerThread() {
                 // unreliable, most visibly on third-person characters during
                 // quick camera pans. Advance framegen to keep its internal frame
                 // index synchronized, but anchor this pair on the real capture.
-                timedBlit(g.inSlot[newSlot]);
+                timedBlit(g.inSlot[newSlot], realFrameWait);
             } else if (!g.outputs.empty() && captureInterval != State::Clock::duration::zero()) {
                 // Pacing strategy differs by regime:
                 //
@@ -2263,13 +2587,16 @@ void workerThread() {
                 // vsync-aligned sleep knows whether a pending deadline would
                 // collide with the SurfaceFlinger slot we just used.
                 auto lastPostedAt = now;
+                size_t outIdx = 0;
                 for (auto &o : g.outputs) {
-                    // Blit first, then sleep: the generated output is ready the
-                    // moment waitIdle() returns, so delaying the first blit by
+                    // Blit first, then sleep: the generated output is ready as
+                    // soon as its fence signals, so delaying the first blit by
                     // `step` adds deterministic latency to every frame and the
                     // overlay looks jittery at steady state. Sleep paces the
                     // gap BEFORE the next blit instead.
-                    timedBlit(o);
+                    timedBlit(o, outIdx < outputWaits.size()
+                                     ? outputWaits[outIdx] : VK_NULL_HANDLE);
+                    ++outIdx;
                     lastPostedAt = State::Clock::now();
                     deadline += step;
                     if (step > State::Clock::duration::zero()) {
@@ -2285,10 +2612,15 @@ void workerThread() {
                 if (step > State::Clock::duration::zero()) {
                     sleepUntilVsyncAligned(State::Clock::now(), lastPostedAt, step);
                 }
-                timedBlit(g.inSlot[newSlot]);
+                timedBlit(g.inSlot[newSlot], realFrameWait);
             } else {
-                for (auto &o : g.outputs) timedBlit(o);
-                timedBlit(g.inSlot[newSlot]);
+                size_t outIdx = 0;
+                for (auto &o : g.outputs) {
+                    timedBlit(o, outIdx < outputWaits.size()
+                                     ? outputWaits[outIdx] : VK_NULL_HANDLE);
+                    ++outIdx;
+                }
+                timedBlit(g.inSlot[newSlot], realFrameWait);
             }
 
             if (!suppressGeneratedFrames) {
@@ -2462,6 +2794,13 @@ int initRenderLoop(const char *cacheDir, const RenderLoopConfig &cfg) {
     // Carrying it forward would silently keep framegen off forever after one
     // bad submit, even on a healthy new device.
     g.framegenAutoDisabled.store(false, std::memory_order_relaxed);
+    // Same reasoning for the sync-fd latch: it is cleared by a device-level
+    // failure on the old handle, and the device is being recreated here.
+    g.gpuSyncUsable.store(true, std::memory_order_relaxed);
+    g.gpuSyncLoggedFallback.store(false, std::memory_order_relaxed);
+    g.gpuSyncFrames.store(0, std::memory_order_relaxed);
+    g.gpuSyncFallbacks.store(0, std::memory_order_relaxed);
+    g.gpuSyncRetireWaitNs.store(0, std::memory_order_relaxed);
 
     int rc = create_session(g.vk);
     if (rc != kOk) {
@@ -2717,6 +3056,9 @@ void shutdownRenderLoop() {
         destroySwapchain();
         g.swapWinW = 0;
         g.swapWinH = 0;
+        // After destroySwapchain: it drains the device, which is the
+        // precondition for destroying a semaphore that a blit may have waited on.
+        destroyOutputSyncSemaphores();
 
         destroy_session(g.vk);
         g.initialized = false;
@@ -2742,6 +3084,12 @@ void shutdownRenderLoop() {
 void getImportCacheStats(uint64_t *hits, uint64_t *misses) {
     if (hits != nullptr) *hits = g.cacheHitsTotal.load(std::memory_order_relaxed);
     if (misses != nullptr) *misses = g.cacheMissesTotal.load(std::memory_order_relaxed);
+}
+
+void getGpuSyncStats(uint64_t *syncFrames, uint64_t *fallbacks, int64_t *retireWaitNs) {
+    if (syncFrames != nullptr) *syncFrames = g.gpuSyncFrames.load(std::memory_order_relaxed);
+    if (fallbacks != nullptr) *fallbacks = g.gpuSyncFallbacks.load(std::memory_order_relaxed);
+    if (retireWaitNs != nullptr) *retireWaitNs = g.gpuSyncRetireWaitNs.load(std::memory_order_relaxed);
 }
 
 int getFramegenState() {
@@ -2836,6 +3184,19 @@ void setBypass(bool bypass) {
 
 void setAntiArtifacts(bool enabled) {
     g.antiArtifacts.store(enabled, std::memory_order_relaxed);
+}
+
+void setGpuSync(bool enabled) {
+    const bool prev = g.gpuSyncEnabled.exchange(enabled, std::memory_order_relaxed);
+    if (prev != enabled) {
+        // Re-arm the per-session latch so turning the toggle back on actually
+        // retries, rather than staying on waitIdle because of an earlier failure.
+        if (enabled) {
+            g.gpuSyncUsable.store(true, std::memory_order_relaxed);
+            g.gpuSyncLoggedFallback.store(false, std::memory_order_relaxed);
+        }
+        LOGW("GPU cross-device sync %s", enabled ? "enabled (sync fds)" : "disabled (waitIdle)");
+    }
 }
 
 void setVsyncPeriodNs(int64_t periodNs) {

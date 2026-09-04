@@ -69,6 +69,7 @@ object BenchmarkLogWriter {
         sb.appendLine("ext_semaphore    = ${extSemaphoreLabel()}")
         sb.appendLine("framegen_state   = ${framegenStateLabel()}")
         sb.appendLine("import_cache     = ${importCacheLabel()}")
+        sb.appendLine("gpu_sync         = ${gpuSyncLabel()}")
         sb.appendLine()
 
         sb.appendLine("[session]")
@@ -229,6 +230,29 @@ object BenchmarkLogWriter {
         if (hits == 0L && misses == 0L) return "no captures imported yet"
         val pct = 100.0 * hits / (hits + misses)
         return "${"%.1f".format(Locale.US, pct)}% hit ($hits hits, $misses misses)"
+    }
+
+    /**
+     * Which cross-device sync the render loop actually used. `waitIdle` here on a device
+     * whose SYNC_FD line above says export+import means the path was refused at runtime —
+     * the toggle is off, or the session is not on the WSI blit — and the logcat tail
+     * carries the reason.
+     */
+    private fun gpuSyncLabel(): String {
+        val buf = LongArray(3)
+        runCatching { NativeBridge.getGpuSyncStats(buf) }.onFailure { return "unavailable" }
+        val (syncFrames, fallbacks) = buf[0] to buf[1]
+        val retireMs = buf[2] / 1_000_000.0
+        if (syncFrames == 0L && fallbacks == 0L) return "no presents yet"
+        val total = syncFrames + fallbacks
+        val pct = 100.0 * syncFrames / total
+        val mode = when {
+            syncFrames == 0L -> "waitIdle (sync fds never used)"
+            fallbacks == 0L -> "sync fds"
+            else -> "mixed"
+        }
+        return "$mode — ${"%.1f".format(Locale.US, pct)}% of $total presents on sync fds, " +
+            "${"%.0f".format(Locale.US, retireMs)} ms total in the deferred input wait"
     }
 
     /** Renders NativeBridge.getExternalSemaphoreSupport()'s bitmask as something readable. */

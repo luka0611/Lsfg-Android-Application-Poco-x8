@@ -204,6 +204,17 @@ fun ParamsFrameGenPacingScreen(nav: NavHostController) {
                     refreshConfigState(prefs)
                 },
             )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            ToggleRow(
+                icon = Icons.Filled.FlashOn,
+                title = stringResource(R.string.param_gpu_sync),
+                description = stringResource(R.string.param_gpu_sync_desc),
+                checked = state.gpuSync,
+                onCheckedChange = {
+                    prefs.setGpuSync(it)
+                    refreshConfigState(prefs)
+                },
+            )
             if (fp16Available) {
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 ToggleRow(

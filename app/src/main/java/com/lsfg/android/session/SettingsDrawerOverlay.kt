@@ -385,6 +385,17 @@ class SettingsDrawerOverlay(
             prefs.setAntiArtifacts(it)
             NativeBridge.setAntiArtifacts(it)
         })
+        // Live because it is the one setting worth A/B-ing without restarting a
+        // session: the render loop reads it per present, so the effect on the HUD
+        // shows up within a frame either way.
+        frameGenSection.addView(switchRow(
+            label = "GPU sync (no waitIdle)",
+            initial = initial.gpuSync,
+        ) {
+            Log.i(TAG, "live: gpuSync=$it")
+            prefs.setGpuSync(it)
+            NativeBridge.setGpuSync(it)
+        })
 
         // FP16 frame-gen shaders — only show when the GPU supports shaderFloat16
         // and the FP16 SPIR-V cache has been populated (same gate the in-app

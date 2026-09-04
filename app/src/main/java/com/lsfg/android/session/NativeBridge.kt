@@ -204,6 +204,15 @@ object NativeBridge {
 
     external fun getFramegenState(): Int
 
+    /**
+     * Fills [out] (size >= 3) with the sync-fd path counters:
+     * `[0]` presents that waited on framegen's exported Android sync fds, `[1]` presents
+     * that fell back to the blocking `vkDeviceWaitIdle`, `[2]` cumulative nanoseconds
+     * spent in the deferred input-retire poll. A healthy device shows `[1]` flat at zero
+     * and `[2]` near zero — framegen finishing before the next capture is even copied.
+     */
+    external fun getGpuSyncStats(out: LongArray)
+
     external fun getExternalSemaphoreSupport(): Int
 
     /**
@@ -225,6 +234,18 @@ object NativeBridge {
 
     /** Enables the native high-motion artifact suppression guard. */
     external fun setAntiArtifacts(enabled: Boolean)
+
+    /**
+     * Selects how the render loop synchronises with framegen's separate VkDevice.
+     *
+     * On (default): framegen exports one Android sync fd per generated frame and each
+     * blit waits for its own frame on the GPU, so framegen's passes overlap the blits
+     * and the pacing sleeps. Off: every present is followed by a blocking
+     * `vkDeviceWaitIdle` on framegen's device, which profiling measured at roughly half
+     * of total frame time. Falls back to the blocking wait by itself on any device that
+     * cannot import SYNC_FD semaphores.
+     */
+    external fun setGpuSync(enabled: Boolean)
 
     /**
      * Reports the overlay display's vsync period to the native pacing loop

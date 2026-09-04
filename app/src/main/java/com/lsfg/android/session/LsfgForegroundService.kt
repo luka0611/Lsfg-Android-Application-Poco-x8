@@ -450,6 +450,10 @@ class LsfgForegroundService : Service() {
                     LsfgLog.w(TAG, "initContext threw", e)
                     -1
                 }
+                // Not part of RenderConfig: the native side defaults it on and the
+                // render loop reads it per present, so it only has to be pushed once
+                // per context — but it does have to be pushed, or the pref is ignored.
+                runCatching { NativeBridge.setGpuSync(cfg.gpuSync) }
                 when {
                     rc == 0 -> {
                         // Framegen active: the ImageReader path is already running;
@@ -765,6 +769,7 @@ class LsfgForegroundService : Service() {
                         queueDepth = pacing.queueDepth,
                     )
                 }.getOrElse { -1 }
+                runCatching { NativeBridge.setGpuSync(cfg.gpuSync) }
                 if (rc == 0 || rc > 0) {
                     lsfgContextActive = true
                     // CRITICAL: destroyContext() above released the native ANativeWindow
