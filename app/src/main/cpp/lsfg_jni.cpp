@@ -217,6 +217,12 @@ Java_com_lsfg_android_session_NativeBridge_getExternalSemaphoreSupport(
     return static_cast<jint>(lsfg_android::externalSemaphoreOpaqueFdSupport());
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_lsfg_android_session_NativeBridge_getExternalSemaphoreSyncFdSupport(
+        JNIEnv * /*env*/, jobject /*thiz*/) {
+    return static_cast<jint>(lsfg_android::externalSemaphoreSyncFdSupport());
+}
+
 extern "C" JNIEXPORT jdouble JNICALL
 Java_com_lsfg_android_session_NativeBridge_getAverageQueueMs(
         JNIEnv * /*env*/, jobject /*thiz*/) {

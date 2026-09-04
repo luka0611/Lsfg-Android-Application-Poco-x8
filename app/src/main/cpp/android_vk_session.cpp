@@ -152,9 +152,14 @@ uint32_t find_compute_family(VkPhysicalDevice phys) {
 // Set by the probe in create_session; read back over JNI so the benchmark report
 // can carry it without anyone needing a logcat.
 std::atomic<int> g_externalSemaphoreOpaqueFd{-1};
+std::atomic<int> g_externalSemaphoreSyncFd{-1};
 
 int externalSemaphoreOpaqueFdSupport() {
     return g_externalSemaphoreOpaqueFd.load(std::memory_order_relaxed);
+}
+
+int externalSemaphoreSyncFdSupport() {
+    return g_externalSemaphoreSyncFd.load(std::memory_order_relaxed);
 }
 
 int create_session(VulkanSession &out) {
@@ -229,41 +234,47 @@ int create_session(VulkanSession &out) {
          props.vendorID, props.deviceID,
          (unsigned long long)out.deviceUuid);
 
-    // Framegen's presentContext(id, inSem, outSem) can take real semaphores instead of
-    // the per-frame cross-device vkDeviceWaitIdle the Android wrapper currently uses —
-    // measured at roughly half of total frame time. framegen imports them as
-    // VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT (framegen/src/core/semaphore.cpp),
-    // and Android's native external type is SYNC_FD, so OPAQUE_FD support is the thing
-    // that decides whether that path is reachable on this GPU without also changing
-    // framegen. Probe and log it rather than guessing.
+    // Whether the per-frame cross-device vkDeviceWaitIdle (measured at roughly half of
+    // total frame time) can be replaced by real semaphores depends entirely on which
+    // external handle types this driver supports for semaphores.
+    //
+    // OPAQUE_FD is what framegen's Core::Semaphore uses today, and it is also the only
+    // type that supports framegen's current model, where the caller owns the semaphore
+    // and framegen imports the same shared payload and signals it.
+    //
+    // SYNC_FD is Android's native type and has no shared payload: an import is always
+    // temporary and exists only to wait on work someone else submitted. Supporting it
+    // means inverting the output direction so framegen exports and the caller waits.
+    //
+    // If neither is exportable and importable, no cross-device semaphore synchronisation
+    // is possible on this GPU and vkDeviceWaitIdle is the only correct option.
     {
-        const VkPhysicalDeviceExternalSemaphoreInfo semInfo{
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
-            .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
+        auto probe = [&out](VkExternalSemaphoreHandleTypeFlagBits type) -> int {
+            auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceExternalSemaphoreProperties>(
+                vkGetInstanceProcAddr(out.instance,
+                                      "vkGetPhysicalDeviceExternalSemaphoreProperties"));
+            if (fn == nullptr) return -1;
+            const VkPhysicalDeviceExternalSemaphoreInfo info{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+                .handleType = type,
+            };
+            VkExternalSemaphoreProperties props{
+                .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES,
+            };
+            fn(out.physicalDevice, &info, &props);
+            return ((props.externalSemaphoreFeatures &
+                        VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) ? 1 : 0)
+                 | ((props.externalSemaphoreFeatures &
+                        VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) ? 2 : 0);
         };
-        VkExternalSemaphoreProperties semProps{
-            .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES,
-        };
-        auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceExternalSemaphoreProperties>(
-            vkGetInstanceProcAddr(out.instance,
-                                  "vkGetPhysicalDeviceExternalSemaphoreProperties"));
-        if (fn != nullptr) {
-            fn(out.physicalDevice, &semInfo, &semProps);
-            const bool exportable = (semProps.externalSemaphoreFeatures &
-                VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) != 0;
-            const bool importable = (semProps.externalSemaphoreFeatures &
-                VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) != 0;
-            g_externalSemaphoreOpaqueFd.store(
-                (exportable ? 1 : 0) | (importable ? 2 : 0), std::memory_order_relaxed);
-            LOGW("external semaphore OPAQUE_FD: exportable=%d importable=%d "
-                 "(compatible=0x%x export=0x%x) — semaphore-based framegen sync %s",
-                 (int)exportable, (int)importable,
-                 semProps.compatibleHandleTypes, semProps.exportFromImportedHandleTypes,
-                 (exportable && importable) ? "is possible" : "would need SYNC_FD in framegen");
-        } else {
-            LOGW("vkGetPhysicalDeviceExternalSemaphoreProperties unavailable — "
-                 "cannot tell whether semaphore-based framegen sync is possible");
-        }
+        const int opaque = probe(VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT);
+        const int syncfd = probe(VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+        g_externalSemaphoreOpaqueFd.store(opaque, std::memory_order_relaxed);
+        g_externalSemaphoreSyncFd.store(syncfd, std::memory_order_relaxed);
+        LOGW("external semaphore support: OPAQUE_FD=%d SYNC_FD=%d "
+             "(bit0 exportable, bit1 importable, -1 unqueryable) — cross-device sync %s",
+             opaque, syncfd,
+             (opaque == 3 || syncfd == 3) ? "is possible" : "is NOT possible on this GPU");
     }
 
     out.computeFamilyIdx = find_compute_family(out.physicalDevice);

@@ -102,6 +102,11 @@ struct VulkanSession {
 /// vkDeviceWaitIdle without also changing framegen to use SYNC_FD.
 int externalSemaphoreOpaqueFdSupport();
 
+/// Same, for VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT — Android's native external
+/// type. If neither this nor OPAQUE_FD reports 3, no cross-device semaphore sync is
+/// possible on this GPU and the per-frame vkDeviceWaitIdle cannot be replaced.
+int externalSemaphoreSyncFdSupport();
+
 // Acquire a command buffer + fence from the ring. Blocks (via vkWaitForFences)
 // until the slot's previous submission is retired, then resets both so the
 // caller can record fresh commands. Returns true on success.

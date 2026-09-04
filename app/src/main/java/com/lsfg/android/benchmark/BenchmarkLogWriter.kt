@@ -185,19 +185,22 @@ object BenchmarkLogWriter {
 
     /** Renders NativeBridge.getExternalSemaphoreSupport()'s bitmask as something readable. */
     private fun extSemaphoreLabel(): String {
-        val bits = runCatching { NativeBridge.getExternalSemaphoreSupport() }.getOrDefault(-1)
-        return when {
-            bits < 0 -> "not probed (no Vulkan session created yet)"
-            bits and 3 == 3 -> "OPAQUE_FD export+import OK — semaphore sync possible ($bits)"
-            else -> {
-                val parts = buildList {
-                    if (bits and 1 != 0) add("exportable")
-                    if (bits and 2 != 0) add("importable")
-                }
-                val have = if (parts.isEmpty()) "neither" else parts.joinToString("+")
-                "OPAQUE_FD $have — framegen would need SYNC_FD ($bits)"
-            }
+        val opaque = runCatching { NativeBridge.getExternalSemaphoreSupport() }.getOrDefault(-1)
+        val syncFd = runCatching { NativeBridge.getExternalSemaphoreSyncFdSupport() }.getOrDefault(-1)
+        fun describe(bits: Int) = when {
+            bits < 0 -> "unqueryable"
+            bits and 3 == 3 -> "export+import"
+            bits and 1 != 0 -> "export only"
+            bits and 2 != 0 -> "import only"
+            else -> "neither"
         }
+        val verdict = when {
+            opaque < 0 && syncFd < 0 -> "not probed (no Vulkan session created yet)"
+            opaque and 3 == 3 -> "cross-device sync possible via OPAQUE_FD"
+            syncFd and 3 == 3 -> "cross-device sync possible via SYNC_FD"
+            else -> "NO cross-device semaphore sync on this GPU — waitIdle is unavoidable"
+        }
+        return "OPAQUE_FD ${describe(opaque)} ($opaque), SYNC_FD ${describe(syncFd)} ($syncFd) — $verdict"
     }
 
     private fun displayRefreshHz(ctx: Context): String {

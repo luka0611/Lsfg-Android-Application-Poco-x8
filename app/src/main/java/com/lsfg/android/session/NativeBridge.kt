@@ -198,6 +198,13 @@ object NativeBridge {
 
     external fun getExternalSemaphoreSupport(): Int
 
+    /**
+     * Same bitmask for SYNC_FD, Android's native external semaphore type. If neither this
+     * nor [getExternalSemaphoreSupport] returns 3, no cross-device semaphore sync is
+     * possible on this GPU and the per-frame vkDeviceWaitIdle cannot be removed.
+     */
+    external fun getExternalSemaphoreSyncFdSupport(): Int
+
     external fun getProfileWindowNs(out: LongArray): Int
 
     /**
