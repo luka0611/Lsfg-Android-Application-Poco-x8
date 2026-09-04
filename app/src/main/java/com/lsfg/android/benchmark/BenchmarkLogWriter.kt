@@ -58,6 +58,12 @@ object BenchmarkLogWriter {
         sb.appendLine("native           = ${runCatching { NativeBridge.nativeVersion() }.getOrDefault("?")}")
         sb.appendLine("npu_available    = ${runCatching { NativeBridge.isNpuAvailable() }.getOrDefault(false)}")
         sb.appendLine("npu_summary      = ${runCatching { NativeBridge.getNpuSummary() }.getOrDefault("?")}")
+        // Decides whether the per-frame cross-device vkDeviceWaitIdle (about half of
+        // total frame time in profiling) can be replaced by framegen's existing
+        // presentContext(inSem, outSem) semaphore path, or whether framegen itself has
+        // to move off OPAQUE_FD onto Android's native SYNC_FD first. Reported here so
+        // answering that needs the benchmark, not a logcat capture.
+        sb.appendLine("ext_semaphore    = ${extSemaphoreLabel()}")
         sb.appendLine()
 
         sb.appendLine("[session]")
@@ -160,6 +166,23 @@ object BenchmarkLogWriter {
     private fun formatTimestamp(ms: Long): String {
         val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
         return fmt.format(Date(ms))
+    }
+
+    /** Renders NativeBridge.getExternalSemaphoreSupport()'s bitmask as something readable. */
+    private fun extSemaphoreLabel(): String {
+        val bits = runCatching { NativeBridge.getExternalSemaphoreSupport() }.getOrDefault(-1)
+        return when {
+            bits < 0 -> "not probed (no Vulkan session created yet)"
+            bits and 3 == 3 -> "OPAQUE_FD export+import OK — semaphore sync possible ($bits)"
+            else -> {
+                val parts = buildList {
+                    if (bits and 1 != 0) add("exportable")
+                    if (bits and 2 != 0) add("importable")
+                }
+                val have = if (parts.isEmpty()) "neither" else parts.joinToString("+")
+                "OPAQUE_FD $have — framegen would need SYNC_FD ($bits)"
+            }
+        }
     }
 
     private fun displayRefreshHz(ctx: Context): String {

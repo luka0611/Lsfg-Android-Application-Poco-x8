@@ -8,6 +8,7 @@
 
 #include "android_shader_loader.hpp"
 #include "android_vk_probe.hpp"
+#include "android_vk_session.hpp"
 #include "crash_reporter.hpp"
 #include "lsfg_render_loop.hpp"
 #include "nnapi_npu.hpp"
@@ -202,6 +203,12 @@ extern "C" JNIEXPORT jlong JNICALL
 Java_com_lsfg_android_session_NativeBridge_getUniqueCaptureCount(
         JNIEnv * /*env*/, jobject /*thiz*/) {
     return static_cast<jlong>(lsfg_android::getUniqueCaptureCount());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_lsfg_android_session_NativeBridge_getExternalSemaphoreSupport(
+        JNIEnv * /*env*/, jobject /*thiz*/) {
+    return static_cast<jint>(lsfg_android::externalSemaphoreOpaqueFdSupport());
 }
 
 extern "C" JNIEXPORT jdouble JNICALL

@@ -1,4 +1,6 @@
 #include "android_vk_session.hpp"
+
+#include <atomic>
 #include "android_shader_loader.hpp"
 
 #include <volk.h>
@@ -147,6 +149,14 @@ uint32_t find_compute_family(VkPhysicalDevice phys) {
 
 } // namespace
 
+// Set by the probe in create_session; read back over JNI so the benchmark report
+// can carry it without anyone needing a logcat.
+std::atomic<int> g_externalSemaphoreOpaqueFd{-1};
+
+int externalSemaphoreOpaqueFdSupport() {
+    return g_externalSemaphoreOpaqueFd.load(std::memory_order_relaxed);
+}
+
 int create_session(VulkanSession &out) {
     if (out.initialized()) return kSessionAlreadyInitialized;
 
@@ -243,6 +253,8 @@ int create_session(VulkanSession &out) {
                 VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) != 0;
             const bool importable = (semProps.externalSemaphoreFeatures &
                 VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) != 0;
+            g_externalSemaphoreOpaqueFd.store(
+                (exportable ? 1 : 0) | (importable ? 2 : 0), std::memory_order_relaxed);
             LOGW("external semaphore OPAQUE_FD: exportable=%d importable=%d "
                  "(compatible=0x%x export=0x%x) — semaphore-based framegen sync %s",
                  (int)exportable, (int)importable,

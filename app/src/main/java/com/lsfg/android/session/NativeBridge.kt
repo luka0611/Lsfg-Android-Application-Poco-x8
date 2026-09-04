@@ -178,6 +178,17 @@ object NativeBridge {
      * by the benchmark mode to surface frame-time profiling without scraping
      * logcat.
      */
+    /**
+     * OPAQUE_FD external-semaphore support on the session's physical device, as a
+     * bitmask: bit 0 = exportable, bit 1 = importable. -1 until a Vulkan session has
+     * been created, or when the driver did not expose the query.
+     *
+     * 3 (both bits) means framegen's presentContext(inSem, outSem) can replace the
+     * per-frame cross-device vkDeviceWaitIdle — measured at roughly half of total
+     * frame time — without also changing framegen to use Android's native SYNC_FD.
+     */
+    external fun getExternalSemaphoreSupport(): Int
+
     external fun getProfileWindowNs(out: LongArray): Int
 
     /**

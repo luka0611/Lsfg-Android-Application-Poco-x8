@@ -95,6 +95,13 @@ struct VulkanSession {
     bool initialized() const { return device != VK_NULL_HANDLE; }
 };
 
+/// Result of the OPAQUE_FD external-semaphore probe run during create_session.
+/// Bit 0 = exportable, bit 1 = importable; -1 until a session has been created or
+/// when the driver did not expose the query. Both bits set means framegen's
+/// presentContext(inSem, outSem) can replace the per-frame cross-device
+/// vkDeviceWaitIdle without also changing framegen to use SYNC_FD.
+int externalSemaphoreOpaqueFdSupport();
+
 // Acquire a command buffer + fence from the ring. Blocks (via vkWaitForFences)
 // until the slot's previous submission is retired, then resets both so the
 // caller can record fresh commands. Returns true on success.
