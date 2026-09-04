@@ -33,7 +33,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: luka0611/lsfg-vc-android-poco-x8
-          ref: release
+          # Carries the SYNC_FD output-fence export the render loop needs to stop
+          # calling waitIdle() after every present. Falls back to `release` behaviour
+          # on any device without VK_KHR_external_semaphore_fd.
+          ref: claude/lsfg-mobile-performance-nhe9vx
           # thirdparty/{dxbc,volk,pe-parse,toml11} are submodules of this repo and
           # the CMake build adds them directly, so a shallow non-recursive checkout
           # fails at configure time.
