@@ -22,6 +22,7 @@ import androidx.core.app.NotificationCompat
 import com.lsfg.android.R
 import com.lsfg.android.benchmark.BenchmarkController
 import com.lsfg.android.benchmark.BenchmarkLogWriter
+import android.widget.Toast
 import com.lsfg.android.prefs.CaptureDefaults
 import com.lsfg.android.prefs.CaptureSource
 import com.lsfg.android.prefs.LsfgPreferences
@@ -294,12 +295,23 @@ class LsfgForegroundService : Service() {
         val cap = if (proj != null) CaptureEngine(this, proj) else null
         capture = cap
         CaptureDiagnostics.onSessionStarted(captureSource)
+        // OverlayManager.updateStatus is a no-op — the overlay's status text was removed
+        // and the call sites were left in place to keep compiling. So every capture error
+        // the engines reported has been invisible: no status line, and nothing on screen
+        // to distinguish "Shizuku could not start" from "capturing fine but zero fps".
+        // A toast is the one channel that cannot be silently dropped.
+        val showCaptureError = { msg: String ->
+            CaptureDiagnostics.onCaptureError(msg)
+            mainHandler.post {
+                runCatching { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+                    .onFailure { LsfgLog.w(TAG, "capture-error toast failed", it) }
+            }
+        }
         val shizukuCap = if (captureSource == CaptureSource.SHIZUKU) {
             ShizukuCaptureEngine(this).also { engine ->
                 engine.setErrorListener { msg ->
                     LsfgLog.w(TAG, msg)
-                    CaptureDiagnostics.onCaptureError(msg)
-                    ov.updateStatus(msg)
+                    showCaptureError(msg)
                 }
             }
         } else null
@@ -308,8 +320,7 @@ class LsfgForegroundService : Service() {
             RootCaptureEngine(this).also { engine ->
                 engine.setErrorListener { msg ->
                     LsfgLog.w(TAG, msg)
-                    CaptureDiagnostics.onCaptureError(msg)
-                    ov.updateStatus(msg)
+                    showCaptureError(msg)
                 }
             }
         } else null

@@ -65,6 +65,18 @@ android {
     }
 
     signingConfigs {
+        // A committed debug key, so every CI build carries the same signature.
+        // Without it AGP generates ~/.android/debug.keystore on demand, which on a fresh
+        // CI runner means a new random key for every build — Android then refuses to
+        // update in place, forcing an uninstall that also discards the Lossless.dll
+        // grant and every setting. Debug keys are not secrets (Android's own default one
+        // ships with the SDK) and this one cannot sign a release build.
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
         create("release") {
             val storeFilePath = project.findProperty("LSFGAndroid_STORE_FILE") as String?
             val storePwd = project.findProperty("LSFGAndroid_STORE_PASSWORD") as String?
