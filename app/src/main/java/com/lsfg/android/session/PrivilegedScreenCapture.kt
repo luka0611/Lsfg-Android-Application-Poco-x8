@@ -191,7 +191,18 @@ internal class PrivilegedScreenCapture(
         findDisplayTokenFromDisplayService()?.let { return it }
         tried += "IDisplayManager"
 
-        for (className in listOf("android.view.DisplayControl", "android.view.SurfaceControl")) {
+        // com.android.server.display.DisplayControl is where getPhysicalDisplayIds and
+        // getPhysicalDisplayToken actually live — confirmed by inspecting services.jar on
+        // a HyperOS 3.0.307 / Android 16 device, which carries
+        // Lcom/android/server/display/DisplayControl; and no android.view.DisplayControl
+        // at all. That alias is what this code asked for, which is why every token lookup
+        // failed while the method sat in a readable jar the whole time. Ordered first;
+        // the android.view name stays for releases that do expose it.
+        for (className in listOf(
+            "com.android.server.display.DisplayControl",
+            "android.view.DisplayControl",
+            "android.view.SurfaceControl",
+        )) {
             val cls = loadDisplayTokenClass(className)
             if (cls == null) {
                 tried += "$className(not loadable)"
