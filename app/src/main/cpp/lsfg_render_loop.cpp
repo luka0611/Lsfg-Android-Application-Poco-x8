@@ -235,6 +235,11 @@ struct State {
     std::mutex captureHashMu;
     uint32_t lastCaptureHash = 0;
     bool lastCaptureHashValid = false;
+    // False once the capture buffers turn out not to be CPU-readable, so
+    // captureContentHash stops trying and pushFrame switches uniqueCaptures over to
+    // counting delivered captures. Re-probed per session because the capture source
+    // (MediaProjection vs Shizuku/root) decides the buffer's usage flags.
+    std::atomic<bool> captureHashingUsable{true};
 
     // Ring buffer of recent post timestamps (ns from CLOCK_MONOTONIC, via
     // steady_clock). Consumed by the HUD frame-pacing graph to show real
@@ -405,10 +410,9 @@ uint32_t captureContentHash(AHardwareBuffer *ahb) {
     // Set once the driver has made it clear it will not hand us a CPU mapping
     // for these buffers. Relaxed ordering is enough: a few extra attempts
     // racing across threads are harmless, and the value only ever goes false.
-    static std::atomic<bool> hashingSupported{true};
     static std::atomic<uint32_t> lockFailures{0};
     constexpr uint32_t kMaxLockFailures = 8;
-    if (!hashingSupported.load(std::memory_order_relaxed)) return 0;
+    if (!g.captureHashingUsable.load(std::memory_order_relaxed)) return 0;
 
     AHardwareBuffer_Desc desc{};
     AHardwareBuffer_describe(ahb, &desc);
@@ -424,9 +428,9 @@ uint32_t captureContentHash(AHardwareBuffer *ahb) {
         // do so by resolving the whole compressed surface to linear, on this
         // thread, every frame — which back-pressures the capture pipeline
         // hard enough to cost the foreground app frames.
-        if (hashingSupported.exchange(false, std::memory_order_relaxed)) {
-            LOGW("capture buffers are not CPU-readable (usage=0x%llx) — "
-                 "duplicate-frame detection disabled",
+        if (g.captureHashingUsable.exchange(false, std::memory_order_relaxed)) {
+            LOGW("capture buffers are not CPU-readable (usage=0x%llx) — duplicate-frame "
+                 "detection disabled; real-fps now counts delivered captures",
                  static_cast<unsigned long long>(desc.usage));
         }
         return 0;
@@ -435,7 +439,7 @@ uint32_t captureContentHash(AHardwareBuffer *ahb) {
     if (AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
             -1, nullptr, &ptr) != 0 || ptr == nullptr) {
         if (lockFailures.fetch_add(1, std::memory_order_relaxed) + 1 >= kMaxLockFailures &&
-            hashingSupported.exchange(false, std::memory_order_relaxed)) {
+            g.captureHashingUsable.exchange(false, std::memory_order_relaxed)) {
             LOGW("AHardwareBuffer_lock failed %u times on capture buffers — "
                  "duplicate-frame detection disabled", kMaxLockFailures);
         }
@@ -2369,6 +2373,7 @@ int initRenderLoop(const char *cacheDir, const RenderLoopConfig &cfg) {
         std::lock_guard<std::mutex> hashLock(g.captureHashMu);
         g.lastCaptureHash = 0;
         g.lastCaptureHashValid = false;
+        g.captureHashingUsable.store(true, std::memory_order_relaxed);
     }
     g.postRingHead.store(0, std::memory_order_relaxed);
     for (auto &slot : g.postRingTimestamps) {
@@ -2536,7 +2541,16 @@ void pushFrame(AHardwareBuffer *ahb, int64_t timestampNs) {
     // often share content. The hash check is ~50-100 μs and runs on the
     // capture thread — doesn't block the worker.
     const uint32_t hash = captureContentHash(ahb);
-    if (hash != 0u) {
+    if (hash == 0u && !g.captureHashingUsable.load(std::memory_order_relaxed)) {
+        // Content hashing is unavailable on this device (see captureContentHash).
+        // Leaving uniqueCaptures pinned at 0 reports "real fps = 0" in the HUD and
+        // the benchmark report, which is worse than an approximate number: it hides
+        // the very measurement needed to tell whether framegen is helping. Count
+        // every delivered capture instead. The figure then means "frames the capture
+        // pipeline delivered" rather than "frames whose content changed", so it can
+        // read high when the compositor repeats a static screen.
+        g.uniqueCaptures.fetch_add(1, std::memory_order_relaxed);
+    } else if (hash != 0u) {
         std::lock_guard<std::mutex> hashLock(g.captureHashMu);
         if (!g.lastCaptureHashValid) {
             g.lastCaptureHash = hash;

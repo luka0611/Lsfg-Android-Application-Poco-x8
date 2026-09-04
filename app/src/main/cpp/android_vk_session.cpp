@@ -219,6 +219,41 @@ int create_session(VulkanSession &out) {
          props.vendorID, props.deviceID,
          (unsigned long long)out.deviceUuid);
 
+    // Framegen's presentContext(id, inSem, outSem) can take real semaphores instead of
+    // the per-frame cross-device vkDeviceWaitIdle the Android wrapper currently uses —
+    // measured at roughly half of total frame time. framegen imports them as
+    // VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT (framegen/src/core/semaphore.cpp),
+    // and Android's native external type is SYNC_FD, so OPAQUE_FD support is the thing
+    // that decides whether that path is reachable on this GPU without also changing
+    // framegen. Probe and log it rather than guessing.
+    {
+        const VkPhysicalDeviceExternalSemaphoreInfo semInfo{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+            .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
+        };
+        VkExternalSemaphoreProperties semProps{
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES,
+        };
+        auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceExternalSemaphoreProperties>(
+            vkGetInstanceProcAddr(out.instance,
+                                  "vkGetPhysicalDeviceExternalSemaphoreProperties"));
+        if (fn != nullptr) {
+            fn(out.physicalDevice, &semInfo, &semProps);
+            const bool exportable = (semProps.externalSemaphoreFeatures &
+                VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) != 0;
+            const bool importable = (semProps.externalSemaphoreFeatures &
+                VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) != 0;
+            LOGW("external semaphore OPAQUE_FD: exportable=%d importable=%d "
+                 "(compatible=0x%x export=0x%x) — semaphore-based framegen sync %s",
+                 (int)exportable, (int)importable,
+                 semProps.compatibleHandleTypes, semProps.exportFromImportedHandleTypes,
+                 (exportable && importable) ? "is possible" : "would need SYNC_FD in framegen");
+        } else {
+            LOGW("vkGetPhysicalDeviceExternalSemaphoreProperties unavailable — "
+                 "cannot tell whether semaphore-based framegen sync is possible");
+        }
+    }
+
     out.computeFamilyIdx = find_compute_family(out.physicalDevice);
     if (out.computeFamilyIdx == UINT32_MAX) {
         LOGE("No compute queue family");
