@@ -137,6 +137,7 @@ internal class PrivilegedScreenCapture(
         val constructors = builderClass.declaredConstructors
         constructors.forEach { it.isAccessible = true }
 
+        var tokenFailure: Throwable? = null
         constructors.filter { ctor ->
             ctor.parameterTypes.size == 1 && IBinder::class.java.isAssignableFrom(ctor.parameterTypes[0])
         }.forEach { ctor ->
@@ -144,7 +145,14 @@ internal class PrivilegedScreenCapture(
                 val displayToken = findDisplayToken()
                 Log.i(TAG, "$captureClassName builder using IBinder display token")
                 return ctor.newInstance(displayToken)
-            }.onFailure { Log.w(TAG, "$captureClassName IBinder builder unavailable", it) }
+            }.onFailure {
+                // Device evidence: this is the branch that actually fails. The Builder
+                // class and its (IBinder) constructor both exist; it is obtaining the
+                // display token that does not work. Swallowing it here made the caller
+                // report "no usable constructor", which pointed at the wrong thing.
+                tokenFailure = it
+                Log.w(TAG, "$captureClassName IBinder builder unavailable", it)
+            }
         }
 
         constructors.filter { ctor ->
@@ -169,7 +177,9 @@ internal class PrivilegedScreenCapture(
             "No usable $captureClassName DisplayCaptureArgs.Builder constructor: " +
                 constructors.joinToString { ctor ->
                     ctor.parameterTypes.joinToString(prefix = "(", postfix = ")") { it.name }
-                }
+                } +
+                (tokenFailure?.let { " — display token: ${it.javaClass.simpleName}: ${it.message}" } ?: ""),
+            tokenFailure,
         )
     }
 
@@ -246,6 +256,19 @@ internal class PrivilegedScreenCapture(
     }
 
     private fun findDisplayTokenFromDisplayControlClass(className: String, cls: Class<*>): IBinder? {
+        // getPhysicalDisplayIds/getPhysicalDisplayToken are thin wrappers over JNI that
+        // lives in libandroid_servers.so. Nothing loads it into this process — Shizuku's
+        // user service is a plain app_process, not system_server — so every call below
+        // throws UnsatisfiedLinkError before it can return a token, and the caller ends
+        // up reporting a missing Builder constructor instead. Loading it is idempotent
+        // and harmless where it is unavailable.
+        if (!androidServersLoadAttempted) {
+            androidServersLoadAttempted = true
+            runCatching { System.loadLibrary("android_servers") }
+                .onSuccess { Log.i(TAG, "libandroid_servers.so loaded for $className") }
+                .onFailure { Log.w(TAG, "libandroid_servers.so unavailable", it) }
+        }
+
         runCatching {
             val ids = cls.methods.firstOrNull { it.name == "getPhysicalDisplayIds" && it.parameterTypes.isEmpty() }
                 ?.invoke(null) as? LongArray
@@ -322,6 +345,8 @@ internal class PrivilegedScreenCapture(
             ?.also { it.isAccessible = true }
             ?: throw NoSuchMethodException("${cls.name}.$name()")
     }
+
+    private var androidServersLoadAttempted = false
 
     /**
      * One resolved capture path. [capture] hides whether the platform exposes the
