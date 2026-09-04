@@ -34,6 +34,18 @@ data class LsfgConfig(
      */
     val gpuSync: Boolean,
     /**
+     * Allow the privileged (Shizuku/root) capture path to fall back to mirroring the whole
+     * display when the UID-filtered screenshot API is unavailable.
+     *
+     * Off by default, and it should stay off unless you are debugging. The mirror captures
+     * every layer on the display, including this app's own overlay — so the overlay shows
+     * the screen, the mirror captures the overlay showing the screen, and the picture
+     * converges to black in about a second. The screenshot path filters by the target
+     * app's UID and cannot do that. The mirror's one advantage is rate: 61 fps measured on
+     * a 60 Hz source, against 38 through MediaProjection.
+     */
+    val allowMirrorCapture: Boolean,
+    /**
      * When true, the render loop loads the precompiled SPIR-V FP16 shader
      * variants from Lossless.dll (resource IDs 304..351) instead of
      * translating the DXBC FP32 set (255..302) via dxvk. Requires
@@ -284,6 +296,7 @@ class LsfgPreferences(ctx: Context) {
         hdrMode = prefs.getBoolean(KEY_HDR, false),
         antiArtifacts = prefs.getBoolean(KEY_ANTI_ARTIFACTS, false),
         gpuSync = prefs.getBoolean(KEY_GPU_SYNC, true),
+        allowMirrorCapture = prefs.getBoolean(KEY_ALLOW_MIRROR_CAPTURE, false),
         framegenFp16 = prefs.getBoolean(KEY_FRAMEGEN_FP16, false),
         targetPackage = prefs.getString(KEY_TARGET, null),
         captureSource = CaptureSource.fromPref(prefs.getString(KEY_CAPTURE_SOURCE, null)),
@@ -353,6 +366,8 @@ class LsfgPreferences(ctx: Context) {
     fun setHdr(value: Boolean) = prefs.edit().putBoolean(KEY_HDR, value).apply()
     fun setAntiArtifacts(value: Boolean) = prefs.edit().putBoolean(KEY_ANTI_ARTIFACTS, value).apply()
     fun setGpuSync(value: Boolean) = prefs.edit().putBoolean(KEY_GPU_SYNC, value).apply()
+    fun setAllowMirrorCapture(value: Boolean) =
+        prefs.edit().putBoolean(KEY_ALLOW_MIRROR_CAPTURE, value).apply()
     fun setFramegenFp16(value: Boolean) = prefs.edit().putBoolean(KEY_FRAMEGEN_FP16, value).apply()
     fun setTargetPackage(pkg: String?) = prefs.edit().putString(KEY_TARGET, pkg).apply()
     fun setCaptureSource(value: CaptureSource) = prefs.edit()
@@ -432,6 +447,7 @@ class LsfgPreferences(ctx: Context) {
         private const val KEY_HDR = "hdr"
         private const val KEY_ANTI_ARTIFACTS = "anti_artifacts"
         private const val KEY_GPU_SYNC = "gpu_sync"
+        private const val KEY_ALLOW_MIRROR_CAPTURE = "allow_mirror_capture"
         private const val KEY_FRAMEGEN_FP16 = "framegen_fp16"
         private const val KEY_TARGET = "target_pkg"
         private const val KEY_CAPTURE_SOURCE = "capture_source"

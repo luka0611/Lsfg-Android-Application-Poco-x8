@@ -206,6 +206,17 @@ fun ParamsFrameGenPacingScreen(nav: NavHostController) {
             )
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             ToggleRow(
+                icon = Icons.Filled.Warning,
+                title = stringResource(R.string.param_mirror_capture),
+                description = stringResource(R.string.param_mirror_capture_desc),
+                checked = state.allowMirrorCapture,
+                onCheckedChange = {
+                    prefs.setAllowMirrorCapture(it)
+                    refreshConfigState(prefs)
+                },
+            )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            ToggleRow(
                 icon = Icons.Filled.FlashOn,
                 title = stringResource(R.string.param_gpu_sync),
                 description = stringResource(R.string.param_gpu_sync_desc),

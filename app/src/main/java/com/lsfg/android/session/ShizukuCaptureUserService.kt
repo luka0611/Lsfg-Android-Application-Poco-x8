@@ -30,22 +30,24 @@ class ShizukuCaptureUserService : IShizukuCaptureService.Stub() {
         width: Int,
         height: Int,
         maxFps: Int,
+        allowMirror: Boolean,
         callback: IShizukuFrameCallback,
     ) {
         stopCapture()
         running.set(true)
 
-        // Preferred: a mirroring VirtualDisplay, which pushes frames at the display's own
-        // rate into an ImageReader. The screenshot loop below is a fallback — it drives a
-        // one-shot capture API in a polling loop, so it is capped by however fast a single
-        // screenshot round-trips even when every reflection layer in it works.
-        val mirrorFailures = mutableListOf<String>()
-        if (startMirrorCapture(width, height, callback, mirrorFailures)) return
-
-        Log.w(TAG, "Mirror capture unavailable, falling back to the screenshot loop: $mirrorFailures")
+        // Screenshot capture first, despite being the slower shape, because it filters by
+        // the target app's UID: our own overlay belongs to a different UID and so is never
+        // in frame. That property is what makes it correct here.
+        //
+        // The mirror has no such filter — it copies the whole display, overlay included, so
+        // we capture our own output, draw it, capture that, and the image converges to
+        // black within a second. It reaches the full display rate (61 fps measured, against
+        // 38 through MediaProjection) and is worth keeping for that, but only for a caller
+        // that knows what it is asking for.
         val periodMs = (1000L / maxFps.coerceIn(15, 120)).coerceAtLeast(8L)
         worker = Thread({
-            runCaptureLoop(targetUid, width, height, periodMs, callback, mirrorFailures)
+            runCaptureLoop(targetUid, width, height, periodMs, allowMirror, callback)
         }, "lsfg-shizuku-capture").also { it.start() }
     }
 
@@ -152,22 +154,34 @@ class ShizukuCaptureUserService : IShizukuCaptureService.Stub() {
         width: Int,
         height: Int,
         periodMs: Long,
+        allowMirror: Boolean,
         callback: IShizukuFrameCallback,
-        mirrorFailures: List<String>,
     ) {
         val capture = runCatching { PrivilegedScreenCapture(width, height, targetUid) }
             .getOrElse { e ->
                 Log.w(TAG, "Unable to initialize privileged capture", e)
-                // Report both halves: the mirror is the path that was supposed to work, so
-                // its failure is the more useful half and was previously never surfaced.
-                callback.onError(
-                    "Shizuku capture unavailable. mirror: ${mirrorFailures.joinToString("; ")} " +
-                        "| screenshot: ${e.message ?: e.javaClass.simpleName}",
-                )
+                val screenshotFailure = e.message ?: e.javaClass.simpleName
+                if (allowMirror) {
+                    val mirrorFailures = mutableListOf<String>()
+                    if (startMirrorCapture(width, height, callback, mirrorFailures)) {
+                        Log.w(TAG, "Screenshot capture unavailable, using the mirror: $screenshotFailure")
+                        return
+                    }
+                    callback.onError(
+                        "Shizuku capture unavailable. screenshot: $screenshotFailure " +
+                            "| mirror: ${mirrorFailures.joinToString("; ")}",
+                    )
+                } else {
+                    callback.onError(
+                        "Shizuku capture unavailable: $screenshotFailure " +
+                            "(mirror fallback is off; enable it in settings to try the " +
+                            "whole-screen path, which captures the overlay too)",
+                    )
+                }
                 running.set(false)
                 return
             }
-        lastBackend = "screenshot loop"
+        lastBackend = "screenshot loop (uid-filtered)"
 
         var lastFrameNs = 0L
         val targetPeriodNs = periodMs * 1_000_000L

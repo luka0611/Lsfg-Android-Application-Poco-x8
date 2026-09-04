@@ -94,6 +94,8 @@
     <string name="param_hdr_desc">Enable only if your device and game output HDR.</string>
     <string name="param_anti_artifacts">Anti-artifacts Mode</string>
     <string name="param_anti_artifacts_desc">Suppress generated frames during very fast camera movement to reduce missing character parts and warping. Off by default.</string>
+    <string name="param_mirror_capture">Mirror fallback (Shizuku)</string>
+    <string name="param_mirror_capture_desc">If privileged screenshot capture is unavailable, mirror the whole display instead. Faster, but it captures this app\'s own overlay too, so the picture feeds back on itself and goes black. Debugging only.</string>
     <string name="param_gpu_sync">GPU Sync</string>
     <string name="param_gpu_sync_desc">Wait for each generated frame on the GPU instead of blocking the CPU after every frame-gen pass. Falls back automatically on devices that can\'t import Android sync fences. On by default; turn off to compare.</string>
     <string name="param_framegen_fp16">FP16 frame-gen shaders</string>

@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import com.lsfg.android.BuildConfig
+import com.lsfg.android.prefs.LsfgPreferences
 import com.lsfg.android.shizuku.IShizukuCaptureService
 import com.lsfg.android.shizuku.IShizukuFrameCallback
 import rikka.shizuku.Shizuku
@@ -134,7 +135,11 @@ class ShizukuCaptureEngine(
             return
         }
         runCatching {
-            svc.startCapture(targetUid, width, height, maxFps, frameCallback)
+            svc.startCapture(
+                targetUid, width, height, maxFps,
+                LsfgPreferences(ctx).load().allowMirrorCapture,
+                frameCallback,
+            )
             // Which of the two backends actually resolved is the fact every previous
             // round of this was missing; record it where the report can see it.
             runCatching { svc.describeBackend() }

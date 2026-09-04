@@ -93,7 +93,9 @@ class RootCaptureEngine(private val ctx: Context) {
             return
         }
         runCatching {
-            svc.startCapture(targetUid, width, height, maxFps, frameCallback)
+            // Root capture has no mirror path of its own, so the flag is inert here; it
+            // is passed only to satisfy the interface the two services share.
+            svc.startCapture(targetUid, width, height, maxFps, false, frameCallback)
             LsfgLog.i(TAG, "Root ${if (metricsOnly) "metrics" else "capture"} started pkg=$targetPackage uid=$targetUid ${width}x${height}")
         }.onFailure {
             LsfgLog.w(TAG, "Root startCapture failed", it)

@@ -23,6 +23,7 @@ class RootCaptureService : RootService() {
             width: Int,
             height: Int,
             maxFps: Int,
+            @Suppress("UNUSED_PARAMETER") allowMirror: Boolean,
             callback: IShizukuFrameCallback,
         ) {
             stopCapture()
