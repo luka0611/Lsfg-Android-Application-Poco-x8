@@ -222,23 +222,28 @@ internal class PrivilegedScreenCapture(
      * getPhysicalDisplayToken since Android 14 moved them off SurfaceControl — is not
      * part of the framework an app process gets. It ships in services.jar, system_server's
      * own jar, so Class.forName cannot see it from Shizuku's user service no matter what
-     * native library is loaded. Loading that jar explicitly is how shell-based screenshot
-     * tools reach it, and it is the piece that was missing.
+     * native library is loaded.
+     *
+     * Loading the jar with a plain PathClassLoader gets the class but leaves its native
+     * methods unbound, because libandroid_servers registers its JNI against whichever
+     * loader loaded the library — the app's, under System.loadLibrary — and not the one
+     * holding this class. [SystemServerClasses] does both halves correctly.
      */
     private fun loadDisplayTokenClass(className: String): Class<*>? {
-        runCatching { return Class.forName(className) }
-            .onFailure { Log.w(TAG, "Display token class not on app classpath: $className", it) }
-
-        return runCatching {
-            val loader = servicesJarLoader ?: dalvik.system.PathClassLoader(
-                SERVICES_JAR,
-                javaClass.classLoader,
-            ).also { servicesJarLoader = it }
-            loader.loadClass(className).also {
-                Log.i(TAG, "Loaded $className from $SERVICES_JAR")
+        runCatching {
+            val cls = Class.forName(className)
+            // On the app classpath, so System.loadLibrary's implicit "caller's loader" is
+            // the right one for it.
+            if (!androidServersLoadAttempted) {
+                androidServersLoadAttempted = true
+                runCatching { System.loadLibrary("android_servers") }
+                    .onFailure { Log.w(TAG, "libandroid_servers.so unavailable", it) }
             }
-        }.onFailure { Log.w(TAG, "Display token class unavailable from services.jar: $className", it) }
-            .getOrNull()
+            return cls
+        }.onFailure { Log.w(TAG, "Display token class not on app classpath: $className", it) }
+
+        return SystemServerClasses.load(className, withNativeLibrary = "android_servers")
+            ?.also { Log.i(TAG, "Loaded $className from the system server classpath") }
     }
 
     private fun findDisplayTokenFromDisplayManagerGlobal(): IBinder? {
@@ -301,18 +306,10 @@ internal class PrivilegedScreenCapture(
 
     private fun findDisplayTokenFromDisplayControlClass(className: String, cls: Class<*>): IBinder? {
         // getPhysicalDisplayIds/getPhysicalDisplayToken are thin wrappers over JNI that
-        // lives in libandroid_servers.so. Nothing loads it into this process — Shizuku's
-        // user service is a plain app_process, not system_server — so every call below
-        // throws UnsatisfiedLinkError before it can return a token, and the caller ends
-        // up reporting a missing Builder constructor instead. Loading it is idempotent
-        // and harmless where it is unavailable.
-        if (!androidServersLoadAttempted) {
-            androidServersLoadAttempted = true
-            runCatching { System.loadLibrary("android_servers") }
-                .onSuccess { Log.i(TAG, "libandroid_servers.so loaded for $className") }
-                .onFailure { Log.w(TAG, "libandroid_servers.so unavailable", it) }
-        }
-
+        // lives in libandroid_servers.so, and is loaded by loadDisplayTokenClass into the
+        // same class loader that produced `cls` — loading it here instead would bind the
+        // JNI registration to this class's loader rather than that one, which is precisely
+        // the failure that made every call below throw after the class itself resolved.
         runCatching {
             val ids = cls.methods.firstOrNull { it.name == "getPhysicalDisplayIds" && it.parameterTypes.isEmpty() }
                 ?.invoke(null) as? LongArray
@@ -391,7 +388,6 @@ internal class PrivilegedScreenCapture(
     }
 
     private var androidServersLoadAttempted = false
-    private var servicesJarLoader: ClassLoader? = null
 
     /**
      * One resolved capture path. [capture] hides whether the platform exposes the
@@ -405,8 +401,5 @@ internal class PrivilegedScreenCapture(
 
     companion object {
         private const val TAG = "PrivilegedCapture"
-
-        /** system_server's jar, which carries android.view.DisplayControl. */
-        private const val SERVICES_JAR = "/system/framework/services.jar"
     }
 }

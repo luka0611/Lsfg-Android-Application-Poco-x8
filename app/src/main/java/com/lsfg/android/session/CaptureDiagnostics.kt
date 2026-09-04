@@ -22,10 +22,26 @@ object CaptureDiagnostics {
     var lastError: String? = null
         private set
 
+    /**
+     * What the privileged capture service actually resolved to, straight from its own
+     * describeBackend(). For the privileged paths this is the single most useful line in
+     * the report: "mirror" and "screenshot loop" have very different ceilings, and until
+     * now nothing distinguished them — or said which reflection layer gave way.
+     */
+    @Volatile
+    var backend: String? = null
+        private set
+
     /** Called when a session starts, before any capture engine is created. */
     fun onSessionStarted(source: CaptureSource) {
         this.source = source
         this.lastError = null
+        this.backend = null
+    }
+
+    /** Called once the capture service is bound and has been asked what it resolved to. */
+    fun onBackendResolved(description: String) {
+        this.backend = description
     }
 
     /** Called for every error a capture engine reports; the newest one wins. */
@@ -36,4 +52,6 @@ object CaptureDiagnostics {
     fun sourceLabel(): String = source?.name ?: "unknown (no session started)"
 
     fun errorLabel(): String = lastError ?: "none reported"
+
+    fun backendLabel(): String = backend ?: "n/a (not a privileged capture source)"
 }

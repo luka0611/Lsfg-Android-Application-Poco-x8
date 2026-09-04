@@ -135,6 +135,13 @@ class ShizukuCaptureEngine(
         }
         runCatching {
             svc.startCapture(targetUid, width, height, maxFps, frameCallback)
+            // Which of the two backends actually resolved is the fact every previous
+            // round of this was missing; record it where the report can see it.
+            runCatching { svc.describeBackend() }
+                .onSuccess {
+                    LsfgLog.i(TAG, "Shizuku capture backend: $it")
+                    CaptureDiagnostics.onBackendResolved(it)
+                }
             LsfgLog.i(TAG, "Shizuku ${if (metricsOnly) "metrics" else "capture"} started package=$targetPackage uid=$targetUid ${width}x${height}")
         }.onFailure {
             LsfgLog.w(TAG, "Shizuku startCapture failed", it)

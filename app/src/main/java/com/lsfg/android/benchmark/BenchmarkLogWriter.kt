@@ -76,6 +76,7 @@ object BenchmarkLogWriter {
         sb.appendLine("target_package   = ${targetPackage ?: "(none)"}")
         sb.appendLine("render_size      = ${renderWidth}x${renderHeight}")
         sb.appendLine("capture_source   = ${CaptureDiagnostics.sourceLabel()}")
+        sb.appendLine("capture_backend  = ${CaptureDiagnostics.backendLabel()}")
         sb.appendLine("capture_error    = ${CaptureDiagnostics.errorLabel()}")
         sb.appendLine("started_at       = ${formatTimestamp(startedAtMs)}")
         sb.appendLine("ended_at         = ${formatTimestamp(endedAtMs)}")
