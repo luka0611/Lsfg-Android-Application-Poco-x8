@@ -10,6 +10,15 @@ data class LsfgConfig(
     val lsfgEnabled: Boolean,
     val multiplier: Int,
     val flowScale: Float,
+    /**
+     * Fraction of the display's native resolution the capture, framegen and output
+     * pipeline runs at. 1.0 = native. Lower values shrink the VirtualDisplay, the
+     * ImageReader and every framegen image quadratically, which is the largest single
+     * lever on per-frame GPU cost. The overlay itself stays full size: the WSI path
+     * upscales with vkCmdBlitImage(VK_FILTER_LINEAR) and the CPU path lets
+     * SurfaceFlinger scale via ANativeWindow_setBuffersGeometry.
+     */
+    val captureScale: Float,
     val performanceMode: Boolean,
     val hdrMode: Boolean,
     val antiArtifacts: Boolean,
@@ -217,6 +226,35 @@ object PacingDefaults {
     }
 }
 
+/**
+ * Bounds for the capture resolution scale. The pipeline runs at
+ * `round(native * scale)` on both axes, so 0.7 is roughly half the pixels of native.
+ * The floor is 0.5 because below that the optical flow has too little detail to track
+ * and interpolation artifacts become obvious even at 2x.
+ */
+object CaptureDefaults {
+    const val SCALE_MIN: Float = 0.5f
+    const val SCALE_MAX: Float = 1.0f
+    const val SCALE_DEFAULT: Float = 1.0f
+
+    /**
+     * Applies [scale] to a native dimension. Result is clamped to at least 2 px and
+     * rounded to an even number: odd extents break the chroma-subsampled paths some
+     * drivers select for AHardwareBuffer, and framegen's mip chain assumes it can halve
+     * the extent without a remainder.
+     */
+    fun scaleDimension(native: Int, scale: Float): Int {
+        if (native <= 0) return native
+        val clamped = scale.coerceIn(SCALE_MIN, SCALE_MAX)
+        // At 1.0 return the native extent untouched, so the default path stays exactly
+        // what it was before this setting existed — the even-rounding below would
+        // otherwise shave a pixel off panels with an odd dimension.
+        if (clamped >= SCALE_MAX) return native
+        val scaled = Math.round(native * clamped)
+        return (scaled.coerceAtLeast(2) / 2) * 2
+    }
+}
+
 class LsfgPreferences(ctx: Context) {
 
     private val prefs: SharedPreferences =
@@ -229,6 +267,8 @@ class LsfgPreferences(ctx: Context) {
         lsfgEnabled = prefs.getBoolean(KEY_LSFG_ENABLED, true),
         multiplier = prefs.getInt(KEY_MULTIPLIER, 2).coerceIn(2, 8),
         flowScale = prefs.getFloat(KEY_FLOW_SCALE, 1.0f).coerceIn(0.25f, 1.0f),
+        captureScale = prefs.getFloat(KEY_CAPTURE_SCALE, CaptureDefaults.SCALE_DEFAULT)
+            .coerceIn(CaptureDefaults.SCALE_MIN, CaptureDefaults.SCALE_MAX),
         performanceMode = prefs.getBoolean(KEY_PERF, true),
         hdrMode = prefs.getBoolean(KEY_HDR, false),
         antiArtifacts = prefs.getBoolean(KEY_ANTI_ARTIFACTS, false),
@@ -293,6 +333,10 @@ class LsfgPreferences(ctx: Context) {
     fun setLsfgEnabled(value: Boolean) = prefs.edit().putBoolean(KEY_LSFG_ENABLED, value).apply()
     fun setMultiplier(value: Int) = prefs.edit().putInt(KEY_MULTIPLIER, value).apply()
     fun setFlowScale(value: Float) = prefs.edit().putFloat(KEY_FLOW_SCALE, value).apply()
+
+    fun setCaptureScale(value: Float) = prefs.edit()
+        .putFloat(KEY_CAPTURE_SCALE, value.coerceIn(CaptureDefaults.SCALE_MIN, CaptureDefaults.SCALE_MAX))
+        .apply()
     fun setPerformance(value: Boolean) = prefs.edit().putBoolean(KEY_PERF, value).apply()
     fun setHdr(value: Boolean) = prefs.edit().putBoolean(KEY_HDR, value).apply()
     fun setAntiArtifacts(value: Boolean) = prefs.edit().putBoolean(KEY_ANTI_ARTIFACTS, value).apply()
@@ -370,6 +414,7 @@ class LsfgPreferences(ctx: Context) {
         private const val KEY_LSFG_ENABLED = "lsfg_enabled"
         private const val KEY_MULTIPLIER = "multiplier"
         private const val KEY_FLOW_SCALE = "flow_scale"
+        private const val KEY_CAPTURE_SCALE = "capture_scale"
         private const val KEY_PERF = "performance"
         private const val KEY_HDR = "hdr"
         private const val KEY_ANTI_ARTIFACTS = "anti_artifacts"

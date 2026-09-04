@@ -30,6 +30,7 @@ import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import com.lsfg.android.SHOW_IMAGE_QUALITY
+import com.lsfg.android.prefs.CaptureDefaults
 import com.lsfg.android.prefs.DrawerEdge
 import com.lsfg.android.prefs.GpuPostProcessingMethod
 import com.lsfg.android.prefs.GpuPostProcessingStage
@@ -494,6 +495,61 @@ class SettingsDrawerOverlay(
                     dragging = false
                     prefs.setFlowScale(pendingFlowScale)
                     Log.i(TAG, "live: flowScale release → $pendingFlowScale")
+                    liveParamsListener?.onParamsChanged()
+                }
+            })
+        })
+
+        frameGenSection.addView(sectionSpacer(10))
+
+        // Capture scale. Unlike flow scale — which only shrinks the optical-flow mip
+        // pyramid — this shrinks the VirtualDisplay, the ImageReader and every framegen
+        // image, so the saving is quadratic and applies to the whole per-frame cost.
+        // The overlay stays native; the output blit upscales.
+        val captureScaleValue = TextView(ctx).apply {
+            setTextColor(COLOR_PRIMARY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = android.graphics.Typeface.create(typeface, android.graphics.Typeface.BOLD)
+            text = "%.2f".format(initial.captureScale)
+        }
+        frameGenSection.addView(
+            sliderRow(
+                labelText = "Capture scale",
+                valueView = captureScaleValue,
+            ),
+        )
+        frameGenSection.addView(SeekBar(ctx).apply {
+            max = CAPTURE_SCALE_STEPS
+            progress = ((initial.captureScale - CaptureDefaults.SCALE_MIN) / CAPTURE_SCALE_STEP)
+                .toInt().coerceIn(0, CAPTURE_SCALE_STEPS)
+            progressDrawable = buildSeekTrack()
+            thumb = buildSeekThumb()
+            splitTrack = false
+            var dragging = false
+            var pendingCaptureScale = initial.captureScale
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, p: Int, fromUser: Boolean) {
+                    val f = (CaptureDefaults.SCALE_MIN + p * CAPTURE_SCALE_STEP)
+                        .coerceIn(CaptureDefaults.SCALE_MIN, CaptureDefaults.SCALE_MAX)
+                    captureScaleValue.text = "%.2f".format(f)
+                    if (fromUser) {
+                        pendingCaptureScale = f
+                        // Every change here rebuilds the native context and re-creates the
+                        // capture surfaces, so unlike the cheaper sliders this one only
+                        // commits on release — applying it mid-drag would tear the session
+                        // down once per step.
+                        if (!dragging) {
+                            prefs.setCaptureScale(f)
+                            Log.i(TAG, "live: captureScale tap → $f")
+                            liveParamsListener?.onParamsChanged()
+                        }
+                    }
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) { dragging = true }
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                    dragging = false
+                    prefs.setCaptureScale(pendingCaptureScale)
+                    Log.i(TAG, "live: captureScale release → $pendingCaptureScale")
                     liveParamsListener?.onParamsChanged()
                 }
             })
@@ -2242,6 +2298,10 @@ class SettingsDrawerOverlay(
 
     companion object {
         private const val TAG = "SettingsDrawer"
+        /** Capture-scale slider granularity: 0.50 → 1.00 in 0.05 increments. */
+        private const val CAPTURE_SCALE_STEP = 0.05f
+        private val CAPTURE_SCALE_STEPS =
+            Math.round((CaptureDefaults.SCALE_MAX - CaptureDefaults.SCALE_MIN) / CAPTURE_SCALE_STEP)
 
         // Brand palette (matches ui/theme/Color.kt dark scheme)
         private const val COLOR_PRIMARY = 0xFF7FE3FF.toInt()

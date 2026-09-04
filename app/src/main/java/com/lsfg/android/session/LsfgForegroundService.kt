@@ -22,6 +22,7 @@ import androidx.core.app.NotificationCompat
 import com.lsfg.android.R
 import com.lsfg.android.benchmark.BenchmarkController
 import com.lsfg.android.benchmark.BenchmarkLogWriter
+import com.lsfg.android.prefs.CaptureDefaults
 import com.lsfg.android.prefs.CaptureSource
 import com.lsfg.android.prefs.LsfgPreferences
 import com.lsfg.android.prefs.PacingDefaults
@@ -351,8 +352,21 @@ class LsfgForegroundService : Service() {
             lastSurface = surface
             lastSurfaceW = w
             lastSurfaceH = h
-            // Always tell native about the latest output surface — even if the LSFG
-            // context isn't (yet) active, this lets a future re-init pick it up.
+            // Capture, framegen and the output image run at this reduced size when the
+            // user has scaled the capture down. The overlay Surface stays native — only
+            // the pipeline shrinks — and the final blit upscales for free: vkCmdBlitImage
+            // with VK_FILTER_LINEAR on the WSI path, SurfaceFlinger via
+            // ANativeWindow_setBuffersGeometry on the CPU path. Halving the linear scale
+            // quarters the per-frame pixel cost, so this is the largest single lever on
+            // the pipeline's GPU time.
+            val captureScale = LsfgPreferences(this).load().captureScale
+            val capW = CaptureDefaults.scaleDimension(w, captureScale)
+            val capH = CaptureDefaults.scaleDimension(h, captureScale)
+            if (capW != w || capH != h) {
+                LsfgLog.i(TAG, "Capture scale ${"%.2f".format(captureScale)}: ${w}x${h} -> ${capW}x${capH}")
+            }
+            // The output surface is always the full overlay geometry, never the scaled
+            // one — the native side needs the real window size to size its swapchain.
             runCatching { NativeBridge.setOutputSurface(surface, w, h) }
                 .onFailure { LsfgLog.w(TAG, "setOutputSurface failed", it) }
 
@@ -372,9 +386,9 @@ class LsfgForegroundService : Service() {
                 if (cap != null) {
                     LsfgLog.i(TAG, "Starting ImageReader capture first to consume MediaProjection token")
                     cap.setLsfgNativeInputEnabled(false)
-                    cap.setLsfgMode(w, h)
+                    cap.setLsfgMode(capW, capH)
                 }
-                ov.updateStatus("LSFG: starting ${w}×${h}…")
+                ov.updateStatus("LSFG: starting ${capW}×${capH}…")
 
                 val cfg = LsfgPreferences(this).load()
                 val cacheDir = File(filesDir, "spirv").absolutePath
@@ -385,8 +399,8 @@ class LsfgForegroundService : Service() {
                 val rc = runCatching {
                     NativeBridge.initContext(
                         cacheDir = cacheDir,
-                        width = w,
-                        height = h,
+                        width = capW,
+                        height = capH,
                         multiplier = cfg.multiplier,
                         flowScale = cfg.flowScale,
                         performance = cfg.performanceMode,
@@ -427,13 +441,13 @@ class LsfgForegroundService : Service() {
                         // Framegen active: the ImageReader path is already running;
                         // now allow frames into the native render loop.
                         lsfgContextActive = true
-                        activeRenderW = w
-                        activeRenderH = h
+                        activeRenderW = capW
+                        activeRenderH = capH
                         cap?.setLsfgNativeInputEnabled(true)
                         if (isPrivilegedCapture) {
-                            pendingPrivilegedVideoStart = ShizukuVideoStart(w, h, cfg)
+                            pendingPrivilegedVideoStart = ShizukuVideoStart(capW, capH, cfg)
                         }
-                        ov.updateStatus("LSFG: frame-gen active ${w}×${h} ×${cfg.multiplier}")
+                        ov.updateStatus("LSFG: frame-gen active ${capW}×${capH} ×${cfg.multiplier}")
                         // If the user launched this session via the Benchmark
                         // screen, hand control to BenchmarkController now that
                         // framegen has reached steady state. The controller runs
@@ -446,7 +460,7 @@ class LsfgForegroundService : Service() {
                         if (isPrivilegedCapture) {
                             activeRenderW = 0
                             activeRenderH = 0
-                            pendingPrivilegedVideoStart = ShizukuVideoStart(w, h, cfg)
+                            pendingPrivilegedVideoStart = ShizukuVideoStart(capW, capH, cfg)
                             val label = if (captureSource == CaptureSource.ROOT) "Root" else "Shizuku"
                             ov.updateStatus("LSFG: $label mirror ${w}×${h} (GPU lacks required Vulkan ext)")
                         } else if (cap != null) {
@@ -467,7 +481,7 @@ class LsfgForegroundService : Service() {
                         activeRenderW = 0
                         activeRenderH = 0
                         if (isPrivilegedCapture && rc > 0) {
-                            pendingPrivilegedVideoStart = ShizukuVideoStart(w, h, cfg)
+                            pendingPrivilegedVideoStart = ShizukuVideoStart(capW, capH, cfg)
                             val label = if (captureSource == CaptureSource.ROOT) "Root" else "Shizuku"
                             ov.updateStatus("LSFG: $label mirror active ${w}×${h} (init rc=$rc)")
                         } else if (cap != null) {
@@ -517,8 +531,8 @@ class LsfgForegroundService : Service() {
                 // is our "running in mirror" sentinel — don't try to reinit the
                 // render loop, just keep the capture alive.
                 cap?.setSurface(surface, w, h)
-            } else if (w != activeRenderW || h != activeRenderH) {
-                LsfgLog.i(TAG, "Surface geometry changed ${activeRenderW}x${activeRenderH} -> ${w}x${h}; reinitializing LSFG context")
+            } else if (capW != activeRenderW || capH != activeRenderH) {
+                LsfgLog.i(TAG, "Render geometry changed ${activeRenderW}x${activeRenderH} -> ${capW}x${capH}; reinitializing LSFG context")
                 reinitLsfgContext(w, h)
             }
         }
@@ -671,7 +685,13 @@ class LsfgForegroundService : Service() {
                 pendingReinitW = 0
                 pendingReinitH = 0
                 val cfg = LsfgPreferences(this).load()
-                LsfgLog.i(TAG, "Re-init LSFG context pass=$pass ${targetW}x${targetH} multiplier=${cfg.multiplier} flowScale=${cfg.flowScale} perf=${cfg.performanceMode} hdr=${cfg.hdrMode}")
+                // targetW/targetH are the overlay's native geometry; renderW/renderH are
+                // what the capture and framegen actually run at. They differ only when the
+                // capture scale is below 1.0. Anything that touches the output Surface
+                // keeps using the native pair.
+                val renderW = CaptureDefaults.scaleDimension(targetW, cfg.captureScale)
+                val renderH = CaptureDefaults.scaleDimension(targetH, cfg.captureScale)
+                LsfgLog.i(TAG, "Re-init LSFG context pass=$pass ${targetW}x${targetH} render=${renderW}x${renderH} multiplier=${cfg.multiplier} flowScale=${cfg.flowScale} perf=${cfg.performanceMode} hdr=${cfg.hdrMode}")
 
                 if (lsfgContextActive) {
                     // Stop pushing new captures BEFORE we tear down the native
@@ -697,8 +717,8 @@ class LsfgForegroundService : Service() {
                 val rc = runCatching {
                     NativeBridge.initContext(
                         cacheDir = cacheDir,
-                        width = targetW,
-                        height = targetH,
+                        width = renderW,
+                        height = renderH,
                         multiplier = cfg.multiplier,
                         flowScale = cfg.flowScale,
                         performance = cfg.performanceMode,
@@ -745,13 +765,13 @@ class LsfgForegroundService : Service() {
                         LsfgLog.w(TAG, "reinit: no cached surface to re-attach")
                     }
                     if (rc == 0) {
-                        activeRenderW = targetW
-                        activeRenderH = targetH
-                        cap?.setLsfgMode(targetW, targetH)
+                        activeRenderW = renderW
+                        activeRenderH = renderH
+                        cap?.setLsfgMode(renderW, renderH)
                         cap?.setLsfgNativeInputEnabled(true)
                         val reinitTarget = targetPkgPending ?: LsfgPreferences(this).load().targetPackage
-                        startShizukuVideo(shizukuCapture, reinitTarget, targetW, targetH, cfg)
-                        startRootVideo(rootCapture, reinitTarget, targetW, targetH, cfg)
+                        startShizukuVideo(shizukuCapture, reinitTarget, renderW, renderH, cfg)
+                        startRootVideo(rootCapture, reinitTarget, renderW, renderH, cfg)
                         mainHandler.post {
                             ov.updateStatus("LSFG: ${lastSurfaceW}×${lastSurfaceH} ×${cfg.multiplier} flow=${"%.2f".format(cfg.flowScale)}")
                         }
@@ -761,8 +781,8 @@ class LsfgForegroundService : Service() {
                         activeRenderH = 0
                         if (surface != null) cap?.setSurface(surface, targetW, targetH)
                         val reinitTarget = targetPkgPending ?: LsfgPreferences(this).load().targetPackage
-                        startShizukuVideo(shizukuCapture, reinitTarget, targetW, targetH, cfg)
-                        startRootVideo(rootCapture, reinitTarget, targetW, targetH, cfg)
+                        startShizukuVideo(shizukuCapture, reinitTarget, renderW, renderH, cfg)
+                        startRootVideo(rootCapture, reinitTarget, renderW, renderH, cfg)
                         mainHandler.post {
                             if ((shizukuCapture != null || rootCapture != null) && cap != null) {
                                 ov.updateStatus("LSFG: privileged capture unavailable for mirror fallback (frame-gen unavailable)")

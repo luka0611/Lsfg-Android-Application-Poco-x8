@@ -378,8 +378,23 @@ void noteGpuShaderPassPending() {
 // each luma by >>2 (dropping 2 LSBs) suppresses encoder dither noise that
 // would otherwise mark semantically-identical frames as "different".
 //
-// Cost: ~50-100 μs total — 1× AHardwareBuffer_lock (the AHB was allocated
-// with CPU_READ_OFTEN so the lock is cheap), 64× 4-byte reads, unlock.
+// The ~50-100 μs figure this used to quote applies to the framegen *output*
+// AHBs, which ahb_image_bridge.cpp allocates itself with CPU_READ_OFTEN. The
+// buffers reaching this function come from the capture side instead —
+// CaptureEngine's ImageReader, or SurfaceFlinger on the privileged paths — and
+// carry GPU usage only. Locking those for CPU read is outside the
+// AHardwareBuffer contract: a driver may refuse it, or may honour it by
+// resolving the whole compressed surface (AFBC on Mali, UBWC on Adreno) to
+// linear, at full resolution, on the capture thread, once per frame.
+//
+// Declaring CPU_READ usage on the ImageReader would make the lock legal, but it
+// also pushes gralloc to a CPU-cached, uncompressed layout — paid back as extra
+// bandwidth on every framegen read of that buffer, which is the wrong trade on
+// a bandwidth-bound part. So detect the situation and stop hashing instead.
+// Duplicate frames then reach the worker, but they are already bounded there by
+// queueDepth, so the cost is a wasted interpolation rather than an unbounded
+// pipeline — much cheaper than a per-frame full-resolution detile.
+//
 // Called once per pushFrame from the ImageReader listener thread.
 //
 // Returns 0 on any failure (the caller treats 0 as "unknown" and doesn't
@@ -387,6 +402,14 @@ void noteGpuShaderPassPending() {
 // one frame).
 uint32_t captureContentHash(AHardwareBuffer *ahb) {
     if (ahb == nullptr) return 0;
+    // Set once the driver has made it clear it will not hand us a CPU mapping
+    // for these buffers. Relaxed ordering is enough: a few extra attempts
+    // racing across threads are harmless, and the value only ever goes false.
+    static std::atomic<bool> hashingSupported{true};
+    static std::atomic<uint32_t> lockFailures{0};
+    constexpr uint32_t kMaxLockFailures = 8;
+    if (!hashingSupported.load(std::memory_order_relaxed)) return 0;
+
     AHardwareBuffer_Desc desc{};
     AHardwareBuffer_describe(ahb, &desc);
     if (desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM &&
@@ -395,9 +418,27 @@ uint32_t captureContentHash(AHardwareBuffer *ahb) {
         // bytes. The counter will look stuck but the app won't misbehave.
         return 0;
     }
+    if ((desc.usage & AHARDWAREBUFFER_USAGE_CPU_READ_MASK) == 0) {
+        // Locking a buffer for an access its allocation never declared is
+        // outside the AHardwareBuffer contract. Drivers that honour it anyway
+        // do so by resolving the whole compressed surface to linear, on this
+        // thread, every frame — which back-pressures the capture pipeline
+        // hard enough to cost the foreground app frames.
+        if (hashingSupported.exchange(false, std::memory_order_relaxed)) {
+            LOGW("capture buffers are not CPU-readable (usage=0x%llx) — "
+                 "duplicate-frame detection disabled",
+                 static_cast<unsigned long long>(desc.usage));
+        }
+        return 0;
+    }
     void *ptr = nullptr;
     if (AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
             -1, nullptr, &ptr) != 0 || ptr == nullptr) {
+        if (lockFailures.fetch_add(1, std::memory_order_relaxed) + 1 >= kMaxLockFailures &&
+            hashingSupported.exchange(false, std::memory_order_relaxed)) {
+            LOGW("AHardwareBuffer_lock failed %u times on capture buffers — "
+                 "duplicate-frame detection disabled", kMaxLockFailures);
+        }
         return 0;
     }
     const uint32_t stride = desc.stride * 4u;  // 4 bytes per RGBA8 pixel

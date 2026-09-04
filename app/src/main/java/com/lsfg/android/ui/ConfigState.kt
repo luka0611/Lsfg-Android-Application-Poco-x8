@@ -1,6 +1,7 @@
 package com.lsfg.android.ui
 
 import com.lsfg.android.prefs.LsfgConfig
+import com.lsfg.android.prefs.CaptureDefaults
 import com.lsfg.android.prefs.CaptureSource
 import com.lsfg.android.prefs.CpuPostProcessingPreset
 import com.lsfg.android.prefs.DrawerEdge
@@ -29,6 +30,7 @@ private val shared: MutableStateFlow<LsfgConfig> = MutableStateFlow(
         lsfgEnabled = true,
         multiplier = 2,
         flowScale = 1.0f,
+        captureScale = CaptureDefaults.SCALE_DEFAULT,
         performanceMode = true,
         hdrMode = false,
         antiArtifacts = false,

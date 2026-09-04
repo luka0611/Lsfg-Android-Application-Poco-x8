@@ -118,9 +118,21 @@ class OverlayManager(private val ctx: Context) {
         @Suppress("DEPRECATION")
         wm.defaultDisplay.getRealMetrics(metrics)
         @Suppress("DEPRECATION")
-        requestedRefreshRateHz = wm.defaultDisplay.supportedModes
+        val maxSupportedHz = wm.defaultDisplay.supportedModes
             .maxOfOrNull { it.refreshRate }
             ?: wm.defaultDisplay.refreshRate
+        // The refresh-rate override is a power/thermal lever, not just a pacing hint:
+        // Surface.setFrameRate below pins the panel for as long as the overlay lives, so
+        // leaving it at the panel maximum keeps SurfaceFlinger compositing the capture
+        // VirtualDisplay and the overlay at (say) 120 Hz even when the target app renders
+        // far slower. On mid-range parts that alone costs the game a chunk of its GPU
+        // budget. Honour the user's choice here as well, and only fall back to the panel
+        // maximum while the setting is on AUTO.
+        requestedRefreshRateHz = if (prefs.vsyncRefreshOverride != VsyncRefreshOverride.AUTO) {
+            prefs.vsyncRefreshOverride.hz.toFloat().coerceAtMost(maxSupportedHz)
+        } else {
+            maxSupportedHz
+        }
         // Let the native pacer align its sleeps to this display's vsync.
         // Without it two consecutive unlockAndPost calls (gen + real, or two
         // generated) can land in the same SurfaceFlinger slot and one gets
@@ -128,8 +140,6 @@ class OverlayManager(private val ctx: Context) {
         // disable this or force a specific refresh rate via settings.
         val effectiveHz = if (!prefs.vsyncAlignmentEnabled) {
             0f
-        } else if (prefs.vsyncRefreshOverride != VsyncRefreshOverride.AUTO) {
-            prefs.vsyncRefreshOverride.hz.toFloat()
         } else {
             requestedRefreshRateHz
         }

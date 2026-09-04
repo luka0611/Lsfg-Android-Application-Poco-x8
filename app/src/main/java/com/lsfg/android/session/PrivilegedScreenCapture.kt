@@ -19,12 +19,10 @@ internal class PrivilegedScreenCapture(
     height: Int,
     targetUid: Int,
 ) {
-    private val captureDisplay: Method
-    private val args: Any
-    private val getHardwareBuffer: Method
+    private val backend: Backend
 
     init {
-        val backend = listOf(
+        backend = listOf(
             "android.window.ScreenCapture",
             "android.view.SurfaceControl",
         ).firstNotNullOfOrNull { className ->
@@ -33,14 +31,11 @@ internal class PrivilegedScreenCapture(
                 .getOrNull()
         }
             ?: throw IllegalStateException("No privileged ScreenCapture backend with UID filter is available")
-        captureDisplay = backend.captureDisplay
-        args = backend.args
-        getHardwareBuffer = backend.getHardwareBuffer
     }
 
     fun captureHardwareBuffer(): HardwareBuffer? {
-        val screenshot = captureDisplay.invoke(null, args) ?: return null
-        return getHardwareBuffer.invoke(screenshot) as? HardwareBuffer
+        val screenshot = backend.capture() ?: return null
+        return backend.getHardwareBuffer.invoke(screenshot) as? HardwareBuffer
     }
 
     private fun buildBackend(
@@ -61,11 +56,57 @@ internal class PrivilegedScreenCapture(
         }
         val builtArgs = builderClass.getMethod("build").invoke(builder)
             ?: throw IllegalStateException("$captureClassName args build returned null")
-        return Backend(
-            captureDisplay = findSingleArgMethod(captureClass, "captureDisplay", argsClass),
-            args = builtArgs,
-            getHardwareBuffer = findNoArgMethod(screenshotClass, "getHardwareBuffer"),
-        )
+        val getHardwareBuffer = findNoArgMethod(screenshotClass, "getHardwareBuffer")
+
+        // Android 14 (U) moved the screenshot entry points to android.window.ScreenCapture
+        // and made them asynchronous: captureDisplay(args, listener) returns an int status
+        // and the screenshot arrives through the listener. The synchronous single-argument
+        // overload that Android 12/13 exposed no longer exists there, so probe for the async
+        // form first and keep the legacy one only as a fallback for older releases.
+        findAsyncCapture(captureClass, argsClass, builtArgs)?.let { capture ->
+            return Backend(capture, getHardwareBuffer)
+        }
+
+        val syncCapture = findSingleArgMethod(captureClass, "captureDisplay", argsClass)
+        Log.i(TAG, "$captureClassName: using synchronous captureDisplay(args)")
+        return Backend({ syncCapture.invoke(null, builtArgs) }, getHardwareBuffer)
+    }
+
+    /**
+     * Resolves the Android 14+ pair `createSyncCaptureListener()` +
+     * `captureDisplay(DisplayCaptureArgs, ScreenCaptureListener)`. The listener returned by
+     * `createSyncCaptureListener` carries a single result and its `getBuffer()` blocks until
+     * the compositor delivers it, so a fresh listener is built for every capture.
+     *
+     * Returns null when the class predates the async API, letting the caller fall back.
+     */
+    private fun findAsyncCapture(
+        captureClass: Class<*>,
+        argsClass: Class<*>,
+        builtArgs: Any,
+    ): (() -> Any?)? {
+        val createListener = captureClass.methods.firstOrNull { method ->
+            method.name == "createSyncCaptureListener" && method.parameterTypes.isEmpty()
+        } ?: return null
+        val listenerType = createListener.returnType
+        val capture = (captureClass.methods.asSequence() + captureClass.declaredMethods.asSequence())
+            .firstOrNull { method ->
+                method.name == "captureDisplay" &&
+                    method.parameterTypes.size == 2 &&
+                    method.parameterTypes[0].isAssignableFrom(argsClass) &&
+                    method.parameterTypes[1].isAssignableFrom(listenerType)
+            }
+            ?.also { it.isAccessible = true }
+            ?: return null
+        val getBuffer = runCatching { findNoArgMethod(listenerType, "getBuffer") }
+            .onFailure { Log.w(TAG, "${listenerType.name}.getBuffer() missing", it) }
+            .getOrNull() ?: return null
+        Log.i(TAG, "${captureClass.name}: using async captureDisplay(args, listener)")
+        return {
+            val listener = createListener.invoke(null)
+            capture.invoke(null, builtArgs, listener)
+            getBuffer.invoke(listener)
+        }
     }
 
     private fun createDisplayCaptureArgsBuilder(captureClassName: String, builderClass: Class<*>): Any {
@@ -258,9 +299,13 @@ internal class PrivilegedScreenCapture(
             ?: throw NoSuchMethodException("${cls.name}.$name()")
     }
 
-    private data class Backend(
-        val captureDisplay: Method,
-        val args: Any,
+    /**
+     * One resolved capture path. [capture] hides whether the platform exposes the
+     * synchronous or the listener-based `captureDisplay`, and returns a
+     * `ScreenshotHardwareBuffer` (or null when the compositor produced nothing).
+     */
+    private class Backend(
+        val capture: () -> Any?,
         val getHardwareBuffer: Method,
     )
 
