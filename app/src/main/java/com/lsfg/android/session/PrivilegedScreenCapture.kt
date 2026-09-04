@@ -22,15 +22,39 @@ internal class PrivilegedScreenCapture(
     private val backend: Backend
 
     init {
+        // Why each candidate failed. This runs inside the Shizuku user service process, so
+        // the Log.w lines below land in that process's logcat and never reach the app's
+        // own log or the benchmark report — leaving only the generic message below, which
+        // says a backend could not be built but not which step failed. Class missing,
+        // no usable Builder constructor, no display token and no setUid are four very
+        // different problems with four different fixes, so carry the reasons out with the
+        // exception.
+        val failures = mutableListOf<String>()
         backend = listOf(
             "android.window.ScreenCapture",
             "android.view.SurfaceControl",
         ).firstNotNullOfOrNull { className ->
             runCatching { buildBackend(className, width, height, targetUid) }
-                .onFailure { Log.w(TAG, "Screen capture backend unavailable: $className", it) }
+                .onFailure {
+                    Log.w(TAG, "Screen capture backend unavailable: $className", it)
+                    val cause = generateSequence(it) { e -> e.cause }.last()
+                    failures += buildString {
+                        append(className.substringAfterLast('.'))
+                        append(": ")
+                        append(it.javaClass.simpleName)
+                        it.message?.let { m -> append(" (").append(m.take(160)).append(')') }
+                        if (cause !== it) {
+                            append(" <- ").append(cause.javaClass.simpleName)
+                            cause.message?.let { m -> append(" (").append(m.take(120)).append(')') }
+                        }
+                    }
+                }
                 .getOrNull()
         }
-            ?: throw IllegalStateException("No privileged ScreenCapture backend with UID filter is available")
+            ?: throw IllegalStateException(
+                "No privileged ScreenCapture backend with UID filter is available — " +
+                    failures.joinToString(" || "),
+            )
     }
 
     fun captureHardwareBuffer(): HardwareBuffer? {
