@@ -144,6 +144,25 @@ struct State {
     std::atomic<bool> antiArtifacts{false};
     std::atomic<uint64_t> cacheHits{0};
     std::atomic<uint64_t> cacheMisses{0};
+    // AHardwareBuffer -> VkImage import cache. The ImageReader recycles a bounded
+    // pool (maxImages=5 in CaptureEngine.setLsfgMode), so the same buffers come back
+    // frame after frame — yet the worker imported and then destroyed a VkImage plus
+    // its device memory for every one of them, every frame. cacheHits/cacheMisses and
+    // getAhbId() were already here for this; only the cache was missing.
+    //
+    // Reuse across frames is safe because copyAhbImage always acquires the source
+    // from VK_QUEUE_FAMILY_FOREIGN_EXT with oldLayout = UNDEFINED, so no layout state
+    // carries over between uses. Each entry holds its own AHardwareBuffer reference:
+    // importAhbImage explicitly does not take ownership, and the VkImage is only valid
+    // while the buffer lives. That reference also makes the `ahb` pointer a sound
+    // identity check — a cached buffer cannot be freed, so its address cannot be
+    // recycled under us.
+    struct ImportCacheEntry {
+        uint64_t id = 0;
+        AHardwareBuffer *ahb = nullptr;
+        AhbImage img{};
+    };
+    std::deque<ImportCacheEntry> importCache;
     bool npuPostProcessing = false;
     int npuPreset = 0;
     int npuUpscaleFactor = 1;
@@ -286,6 +305,49 @@ struct State {
 };
 
 State g{};
+
+// Cap chosen just above the ImageReader's 5-deep pool so every buffer in rotation
+// stays resident without the cache growing unbounded if a source ever cycles more.
+constexpr size_t kImportCacheMax = 8;
+
+/// Returns the VkImage import for `ahb`, creating and caching it on first sight.
+/// The returned pointer stays valid for the current frame; callers must NOT destroy
+/// it, the cache owns it. Returns nullptr if the import failed.
+const AhbImage *acquireImportedImage(AHardwareBuffer *ahb) {
+    const uint64_t id = getAhbId(ahb);
+    for (auto &e : g.importCache) {
+        if (e.id == id && e.ahb == ahb) {
+            g.cacheHits.fetch_add(1, std::memory_order_relaxed);
+            return &e.img;
+        }
+    }
+    AhbImage img{};
+    const int rc = importAhbImage(g.vk, ahb, img);
+    if (rc != kOk) {
+        LOGW("importAhbImage failed rc=%d", rc);
+        return nullptr;
+    }
+    g.cacheMisses.fetch_add(1, std::memory_order_relaxed);
+    while (g.importCache.size() >= kImportCacheMax) {
+        auto &oldest = g.importCache.front();
+        destroyAhbImage(g.vk, oldest.img);
+        AHardwareBuffer_release(oldest.ahb);
+        g.importCache.pop_front();
+    }
+    AHardwareBuffer_acquire(ahb);
+    g.importCache.push_back(State::ImportCacheEntry{id, ahb, img});
+    return &g.importCache.back().img;
+}
+
+/// Drops every cached import. Must run with the worker thread stopped, and after any
+/// context teardown that could still be reading these images.
+void clearImportCache() {
+    for (auto &e : g.importCache) {
+        destroyAhbImage(g.vk, e.img);
+        AHardwareBuffer_release(e.ahb);
+    }
+    g.importCache.clear();
+}
 
 struct ShizukuTimingSample {
     bool enabled = false;
@@ -1878,13 +1940,12 @@ void workerThread() {
 
         // Wrap the imported AHB (read-only from our perspective) and copy
         // into the oldest input slot on-the-fly.
-        AhbImage src{};
-        const int rc = importAhbImage(g.vk, ahb, src);
-        if (rc != kOk) {
-            LOGW("importAhbImage failed rc=%d", rc);
+        const AhbImage *srcPtr = acquireImportedImage(ahb);
+        if (srcPtr == nullptr) {
             AHardwareBuffer_release(ahb); // release queue-enqueue ref
             continue;
         }
+        const AhbImage &src = *srcPtr;
 
         // Framegen tracks an internal frameIdx and treats inImg_0 as the
         // "current" frame when frameIdx % 2 == 0, inImg_1 when % 2 == 1
@@ -1942,14 +2003,12 @@ void workerThread() {
             if (!processRealFrameIntoSlot(src, g.inSlot[0]) ||
                     !processRealFrameIntoSlot(src, g.inSlot[1])) {
                 LOGW("bootstrap frame input processing failed");
-                destroyAhbImage(g.vk, src);
                 AHardwareBuffer_release(ahb);
                 continue;
             }
         } else {
             if (!processRealFrameIntoSlot(src, g.inSlot[newSlot])) {
                 LOGW("frame input processing failed");
-                destroyAhbImage(g.vk, src);
                 AHardwareBuffer_release(ahb);
                 continue;
             }
@@ -1977,7 +2036,6 @@ void workerThread() {
             && g.framesCopied > 1
             && shouldSuppressGeneratedFrames(g.inSlot[prevSlot], g.inSlot[newSlot]);
 
-        destroyAhbImage(g.vk, src);
         AHardwareBuffer_release(ahb);
 
         // PROFILE: input copy phase done.
@@ -2636,6 +2694,7 @@ void shutdownRenderLoop() {
         g.gpuPost.reset(g.vk);
         destroyAhbImage(g.vk, g.gpuPostImage);
         for (int i = 0; i < 2; ++i) destroyAhbImage(g.vk, g.inSlot[i]);
+        clearImportCache();
 
 
 
