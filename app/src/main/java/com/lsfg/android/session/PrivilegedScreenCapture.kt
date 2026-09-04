@@ -184,17 +184,50 @@ internal class PrivilegedScreenCapture(
     }
 
     private fun findDisplayToken(): IBinder {
+        val tried = mutableListOf<String>()
+
         findDisplayTokenFromDisplayManagerGlobal()?.let { return it }
+        tried += "DisplayManagerGlobal"
         findDisplayTokenFromDisplayService()?.let { return it }
+        tried += "IDisplayManager"
 
         for (className in listOf("android.view.DisplayControl", "android.view.SurfaceControl")) {
-            val cls = runCatching { Class.forName(className) }
-                .onFailure { Log.w(TAG, "Display token class unavailable: $className", it) }
-                .getOrNull() ?: continue
-
+            val cls = loadDisplayTokenClass(className)
+            if (cls == null) {
+                tried += "$className(not loadable)"
+                continue
+            }
             findDisplayTokenFromDisplayControlClass(className, cls)?.let { return it }
+            tried += className
         }
-        throw IllegalStateException("No display token API is available")
+        throw IllegalStateException("No display token API is available; tried " + tried.joinToString("+"))
+    }
+
+    /**
+     * Loads a display-token class, falling back to services.jar for the ones that live
+     * there.
+     *
+     * android.view.DisplayControl — which owns getPhysicalDisplayIds and
+     * getPhysicalDisplayToken since Android 14 moved them off SurfaceControl — is not
+     * part of the framework an app process gets. It ships in services.jar, system_server's
+     * own jar, so Class.forName cannot see it from Shizuku's user service no matter what
+     * native library is loaded. Loading that jar explicitly is how shell-based screenshot
+     * tools reach it, and it is the piece that was missing.
+     */
+    private fun loadDisplayTokenClass(className: String): Class<*>? {
+        runCatching { return Class.forName(className) }
+            .onFailure { Log.w(TAG, "Display token class not on app classpath: $className", it) }
+
+        return runCatching {
+            val loader = servicesJarLoader ?: dalvik.system.PathClassLoader(
+                SERVICES_JAR,
+                javaClass.classLoader,
+            ).also { servicesJarLoader = it }
+            loader.loadClass(className).also {
+                Log.i(TAG, "Loaded $className from $SERVICES_JAR")
+            }
+        }.onFailure { Log.w(TAG, "Display token class unavailable from services.jar: $className", it) }
+            .getOrNull()
     }
 
     private fun findDisplayTokenFromDisplayManagerGlobal(): IBinder? {
@@ -347,6 +380,7 @@ internal class PrivilegedScreenCapture(
     }
 
     private var androidServersLoadAttempted = false
+    private var servicesJarLoader: ClassLoader? = null
 
     /**
      * One resolved capture path. [capture] hides whether the platform exposes the
@@ -360,5 +394,8 @@ internal class PrivilegedScreenCapture(
 
     companion object {
         private const val TAG = "PrivilegedCapture"
+
+        /** system_server's jar, which carries android.view.DisplayControl. */
+        private const val SERVICES_JAR = "/system/framework/services.jar"
     }
 }
