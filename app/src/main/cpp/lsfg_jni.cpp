@@ -205,6 +205,17 @@ Java_com_lsfg_android_session_NativeBridge_getUniqueCaptureCount(
     return static_cast<jlong>(lsfg_android::getUniqueCaptureCount());
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_lsfg_android_session_NativeBridge_getImportCacheStats(
+        JNIEnv *env, jobject /*thiz*/, jlongArray out) {
+    if (out == nullptr || env->GetArrayLength(out) < 2) return;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    lsfg_android::getImportCacheStats(&hits, &misses);
+    jlong vals[2] = {static_cast<jlong>(hits), static_cast<jlong>(misses)};
+    env->SetLongArrayRegion(out, 0, 2, vals);
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_lsfg_android_session_NativeBridge_getFramegenState(
         JNIEnv * /*env*/, jobject /*thiz*/) {

@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Build
 import android.view.WindowManager
 import androidx.core.content.FileProvider
+import com.lsfg.android.session.CaptureDiagnostics
 import com.lsfg.android.BuildConfig
 import com.lsfg.android.session.NativeBridge
 import java.io.File
@@ -65,11 +66,14 @@ object BenchmarkLogWriter {
         // answering that needs the benchmark, not a logcat capture.
         sb.appendLine("ext_semaphore    = ${extSemaphoreLabel()}")
         sb.appendLine("framegen_state   = ${framegenStateLabel()}")
+        sb.appendLine("import_cache     = ${importCacheLabel()}")
         sb.appendLine()
 
         sb.appendLine("[session]")
         sb.appendLine("target_package   = ${targetPackage ?: "(none)"}")
         sb.appendLine("render_size      = ${renderWidth}x${renderHeight}")
+        sb.appendLine("capture_source   = ${CaptureDiagnostics.sourceLabel()}")
+        sb.appendLine("capture_error    = ${CaptureDiagnostics.errorLabel()}")
         sb.appendLine("started_at       = ${formatTimestamp(startedAtMs)}")
         sb.appendLine("ended_at         = ${formatTimestamp(endedAtMs)}")
         sb.appendLine("total_duration_s = ${"%.1f".format(Locale.US, (endedAtMs - startedAtMs) / 1000.0)}")
@@ -182,6 +186,16 @@ object BenchmarkLogWriter {
             3 -> "AUTO-DISABLED — VK_ERROR_DEVICE_LOST during presentContext"
             else -> "unknown (native call failed)"
         }
+
+    /** AHardwareBuffer import cache hit/miss totals for the session. */
+    private fun importCacheLabel(): String {
+        val buf = LongArray(2)
+        runCatching { NativeBridge.getImportCacheStats(buf) }.onFailure { return "unavailable" }
+        val (hits, misses) = buf[0] to buf[1]
+        if (hits == 0L && misses == 0L) return "no captures imported yet"
+        val pct = 100.0 * hits / (hits + misses)
+        return "${"%.1f".format(Locale.US, pct)}% hit ($hits hits, $misses misses)"
+    }
 
     /** Renders NativeBridge.getExternalSemaphoreSupport()'s bitmask as something readable. */
     private fun extSemaphoreLabel(): String {

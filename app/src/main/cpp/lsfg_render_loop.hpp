@@ -106,6 +106,11 @@ void shutdownRenderLoop();
 /// Why framegen is or is not producing frames, matching workerThread's runFramegen
 /// predicate: 0 active, 1 no context, 2 bypassed by the user toggle, 3 auto-disabled
 /// after VK_ERROR_DEVICE_LOST.
+/// Session totals for the AHardwareBuffer import cache. Hits mean a captured buffer was
+/// recognised and its VkImage reused instead of re-imported; with a recycled ImageReader
+/// pool, misses should settle at the pool size and hits should climb with every frame.
+void getImportCacheStats(uint64_t *hits, uint64_t *misses);
+
 int getFramegenState();
 
 uint64_t getGeneratedFrameCount();

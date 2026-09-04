@@ -194,6 +194,14 @@ object NativeBridge {
      * the frame profile only advance while it is 0, so a report showing zero generated
      * frames is ambiguous without this.
      */
+    /**
+     * Session totals for the AHardwareBuffer import cache into [out] as [hits, misses].
+     * With the ImageReader recycling a fixed pool, misses should settle at the pool size
+     * while hits climb every frame; misses tracking the frame count means the cache is
+     * not recognising buffers.
+     */
+    external fun getImportCacheStats(out: LongArray)
+
     external fun getFramegenState(): Int
 
     external fun getExternalSemaphoreSupport(): Int

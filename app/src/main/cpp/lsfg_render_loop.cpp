@@ -144,6 +144,11 @@ struct State {
     std::atomic<bool> antiArtifacts{false};
     std::atomic<uint64_t> cacheHits{0};
     std::atomic<uint64_t> cacheMisses{0};
+    // Session totals. The two above are drained with exchange() by the frame-profile
+    // logger to get per-window deltas, so they cannot also serve a reader that wants a
+    // running count for the benchmark report.
+    std::atomic<uint64_t> cacheHitsTotal{0};
+    std::atomic<uint64_t> cacheMissesTotal{0};
     // AHardwareBuffer -> VkImage import cache. The ImageReader recycles a bounded
     // pool (maxImages=5 in CaptureEngine.setLsfgMode), so the same buffers come back
     // frame after frame — yet the worker imported and then destroyed a VkImage plus
@@ -318,6 +323,7 @@ const AhbImage *acquireImportedImage(AHardwareBuffer *ahb) {
     for (auto &e : g.importCache) {
         if (e.id == id && e.ahb == ahb) {
             g.cacheHits.fetch_add(1, std::memory_order_relaxed);
+            g.cacheHitsTotal.fetch_add(1, std::memory_order_relaxed);
             return &e.img;
         }
     }
@@ -328,6 +334,7 @@ const AhbImage *acquireImportedImage(AHardwareBuffer *ahb) {
         return nullptr;
     }
     g.cacheMisses.fetch_add(1, std::memory_order_relaxed);
+    g.cacheMissesTotal.fetch_add(1, std::memory_order_relaxed);
     while (g.importCache.size() >= kImportCacheMax) {
         auto &oldest = g.importCache.front();
         destroyAhbImage(g.vk, oldest.img);
@@ -2730,6 +2737,11 @@ void shutdownRenderLoop() {
         g.shizukuPacingJitterNs.store(0, std::memory_order_relaxed);
     }
     LOGI("Render loop shut down");
+}
+
+void getImportCacheStats(uint64_t *hits, uint64_t *misses) {
+    if (hits != nullptr) *hits = g.cacheHitsTotal.load(std::memory_order_relaxed);
+    if (misses != nullptr) *misses = g.cacheMissesTotal.load(std::memory_order_relaxed);
 }
 
 int getFramegenState() {

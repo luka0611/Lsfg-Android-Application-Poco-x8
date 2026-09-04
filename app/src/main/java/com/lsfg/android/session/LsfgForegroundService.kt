@@ -293,10 +293,12 @@ class LsfgForegroundService : Service() {
 
         val cap = if (proj != null) CaptureEngine(this, proj) else null
         capture = cap
+        CaptureDiagnostics.onSessionStarted(captureSource)
         val shizukuCap = if (captureSource == CaptureSource.SHIZUKU) {
             ShizukuCaptureEngine(this).also { engine ->
                 engine.setErrorListener { msg ->
                     LsfgLog.w(TAG, msg)
+                    CaptureDiagnostics.onCaptureError(msg)
                     ov.updateStatus(msg)
                 }
             }
@@ -306,6 +308,7 @@ class LsfgForegroundService : Service() {
             RootCaptureEngine(this).also { engine ->
                 engine.setErrorListener { msg ->
                     LsfgLog.w(TAG, msg)
+                    CaptureDiagnostics.onCaptureError(msg)
                     ov.updateStatus(msg)
                 }
             }
