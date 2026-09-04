@@ -10,6 +10,7 @@ import android.os.RemoteException
 import android.os.SystemClock
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import com.lsfg.android.BuildConfig
 import com.lsfg.android.shizuku.IShizukuCaptureService
 import com.lsfg.android.shizuku.IShizukuFrameCallback
@@ -52,9 +53,24 @@ class ShizukuCaptureEngine(
     private var graphRealEma: Float = 0f
     private var graphGenEma: Float = 0f
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile
+    private var bindInFlight: Boolean = false
+    private var bindTimeout: Runnable? = null
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder?) {
-            service = binder?.takeIf { it.pingBinder() }?.let { IShizukuCaptureService.Stub.asInterface(it) }
+            cancelBindTimeout()
+            val live = binder?.takeIf { it.pingBinder() }
+            if (live == null) {
+                // Previously this left `service` null and fell through to startCapture,
+                // which saw a null service and called bind() again — an invisible rebind
+                // loop that never reported anything, so the session just captured nothing.
+                LsfgLog.w(TAG, "Shizuku user service connected with a dead binder")
+                errorListener?.onError("Shizuku user service connected but its binder is dead")
+                return
+            }
+            service = IShizukuCaptureService.Stub.asInterface(live)
             val start = pendingStart
             if (start != null) {
                 startCapture(start.targetPackage, start.width, start.height, start.maxFps)
@@ -63,7 +79,15 @@ class ShizukuCaptureEngine(
 
         override fun onServiceDisconnected(name: ComponentName) {
             service = null
+            LsfgLog.w(TAG, "Shizuku user service disconnected")
         }
+    }
+
+    @Synchronized
+    private fun cancelBindTimeout() {
+        bindInFlight = false
+        bindTimeout?.let { mainHandler.removeCallbacks(it) }
+        bindTimeout = null
     }
 
     fun setErrorListener(listener: ErrorListener?) {
@@ -120,6 +144,7 @@ class ShizukuCaptureEngine(
 
     fun stop() {
         pendingStart = null
+        cancelBindTimeout()
         stopFpsCounter()
         stopFrameGraph()
         runCatching { service?.stopCapture() }
@@ -238,17 +263,44 @@ class ShizukuCaptureEngine(
         }
     }
 
+    @Synchronized
     private fun bind() {
         if (!isReady()) {
             errorListener?.onError("Shizuku is not running or permission is missing")
             return
         }
-        runCatching {
+        // Don't stack binds: startCaptureInternal calls bind() whenever the service is
+        // absent, and it is reached again from onServiceConnected and from every re-init.
+        if (bindInFlight) return
+        bindInFlight = true
+        val bound = runCatching {
             Shizuku.bindUserService(userServiceArgs(), connection)
         }.onFailure {
+            bindInFlight = false
             LsfgLog.w(TAG, "bindUserService failed", it)
             errorListener?.onError("Shizuku bind failed: ${it.message ?: it.javaClass.simpleName}")
         }
+        if (bound.isFailure) return
+
+        // bindUserService is asynchronous and has no failure callback. When the user
+        // service process never starts — the common case on OEM builds that restrict what
+        // the shell UID may do — onServiceConnected simply never fires, and every path out
+        // of startCaptureInternal has already returned. The session then runs to
+        // completion capturing nothing, with no message anywhere. Time it out so the
+        // failure is visible instead of silent.
+        val timeout = Runnable {
+            if (service == null) {
+                bindInFlight = false
+                LsfgLog.w(TAG, "Shizuku user service did not connect within ${BIND_TIMEOUT_MS}ms")
+                errorListener?.onError(
+                    "Shizuku user service did not start within ${BIND_TIMEOUT_MS / 1000}s — " +
+                        "Shizuku is running and authorised, but it could not launch the " +
+                        "capture process",
+                )
+            }
+        }
+        bindTimeout = timeout
+        mainHandler.postDelayed(timeout, BIND_TIMEOUT_MS)
     }
 
     private fun userServiceArgs(): Shizuku.UserServiceArgs =
@@ -300,6 +352,9 @@ class ShizukuCaptureEngine(
 
     companion object {
         private const val TAG = "ShizukuCapture"
+
+        /** How long to wait for the user service to connect before calling it a failure. */
+        private const val BIND_TIMEOUT_MS = 6_000L
 
         fun requestPermission(requestCode: Int) {
             if (Shizuku.isPreV11()) throw RemoteException("Shizuku pre-v11 is not supported")
