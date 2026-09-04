@@ -1,0 +1,91 @@
+name: Build debug APK
+
+# Builds an installable debug APK and attaches it to the run as an artifact.
+# Debug builds use the auto-generated debug keystore, so no signing secrets are
+# needed — nothing here reads a credential.
+#
+# Run it from the Actions tab ("Run workflow"), or let it fire on a push to the
+# working branch.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - claude/lsfg-mobile-performance-nhe9vx
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # The native build resolves the framegen library through a path relative to
+      # the JNI sources: app/src/main/cpp/../../../../../lsfg-vk-android, i.e. a
+      # directory named exactly "lsfg-vk-android" sitting beside the app root.
+      # actions/checkout refuses to write outside the workspace, so both repos are
+      # checked out into the workspace as siblings instead.
+      - name: Check out the app
+        uses: actions/checkout@v4
+        with:
+          path: LSFG-Android-Application
+
+      - name: Check out lsfg-vk-android beside it
+        uses: actions/checkout@v4
+        with:
+          repository: luka0611/lsfg-vc-android-poco-x8
+          ref: release
+          # thirdparty/{dxbc,volk,pe-parse,toml11} are submodules of this repo and
+          # the CMake build adds them directly, so a shallow non-recursive checkout
+          # fails at configure time.
+          submodules: recursive
+          path: lsfg-vk-android
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: LSFG-Android-Application
+
+      # The runner ships an Android SDK but not necessarily the exact NDK and CMake
+      # this project pins (ndkVersion 27.0.12077973, cmake 3.22.1), and AGP fails
+      # rather than substituting a different version.
+      - name: Install pinned NDK and CMake
+        run: |
+          set -eux
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "cmake;3.22.1" \
+            "ndk;27.0.12077973"
+
+      - name: Build debug APK
+        working-directory: LSFG-Android-Application
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: List what was produced
+        if: always()
+        run: find LSFG-Android-Application/app/build/outputs -name '*.apk' -print
+
+      # splits { abi } emits one APK per ABI. arm64-v8a is the phone build; the
+      # x86_64 one is emulator-only and is uploaded separately so it is obvious
+      # which is which.
+      - name: Upload arm64-v8a APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: lsfg-android-arm64-v8a-debug
+          path: LSFG-Android-Application/app/build/outputs/apk/debug/*arm64-v8a*.apk
+          if-no-files-found: error
+
+      - name: Upload every APK produced
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lsfg-android-all-debug-apks
+          path: LSFG-Android-Application/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
