@@ -86,6 +86,8 @@
     <string name="param_multiplier_desc">Number of frames produced per real frame. 2 = one interpolated frame between each pair. 3–4 recommended on mobile.</string>
     <string name="param_flow_scale">Flow scale</string>
     <string name="param_flow_scale_desc">Internal motion estimation resolution. Lower = faster but less accurate.</string>
+    <string name="param_capture_scale">Capture scale</string>
+    <string name="param_capture_scale_desc">Resolution the capture and frame generation run at, as a fraction of your screen. Lower = much faster, slightly softer. The overlay itself stays full resolution. 0.70 is a good starting point on mid-range GPUs.</string>
     <string name="param_performance_mode">Performance mode (LSFG 3.1P)</string>
     <string name="param_performance_mode_desc">Use the faster, lower-quality shader variant. Recommended on mid-range GPUs.</string>
     <string name="param_hdr">HDR mode</string>

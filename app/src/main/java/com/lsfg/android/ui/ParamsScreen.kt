@@ -22,6 +22,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ShowChart
 import androidx.compose.material.icons.automirrored.filled.ViewSidebar
+import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FlashOn
@@ -58,6 +59,7 @@ import com.lsfg.android.prefs.CpuPostProcessingPreset
 import com.lsfg.android.prefs.DrawerEdge
 import com.lsfg.android.prefs.GpuPostProcessingMethod
 import com.lsfg.android.prefs.GpuPostProcessingStage
+import com.lsfg.android.prefs.CaptureDefaults
 import com.lsfg.android.prefs.LsfgPreferences
 import com.lsfg.android.prefs.NpuPostProcessingPreset
 import com.lsfg.android.prefs.OverlayMode
@@ -145,6 +147,25 @@ fun ParamsFrameGenPacingScreen(nav: NavHostController) {
                 leadingIcon = Icons.AutoMirrored.Filled.ShowChart,
                 onValueChange = {
                     prefs.setFlowScale(it)
+                    refreshConfigState(prefs)
+                },
+            )
+
+            // Distinct from flow scale above: that one only shrinks the motion-estimation
+            // pyramid, this one shrinks the capture, every framegen image and the output
+            // together, so the saving is quadratic and covers the whole per-frame cost.
+            // Snapped to 0.05 because each change tears down and rebuilds the native
+            // context.
+            ValueSlider(
+                title = stringResource(R.string.param_capture_scale),
+                valueDisplay = "%.2f".format(state.captureScale),
+                description = stringResource(R.string.param_capture_scale_desc),
+                value = state.captureScale,
+                range = CaptureDefaults.SCALE_MIN..CaptureDefaults.SCALE_MAX,
+                steps = 9,
+                leadingIcon = Icons.Filled.AspectRatio,
+                onValueChange = {
+                    prefs.setCaptureScale(it)
                     refreshConfigState(prefs)
                 },
             )
