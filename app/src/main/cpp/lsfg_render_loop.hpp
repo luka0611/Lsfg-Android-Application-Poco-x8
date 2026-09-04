@@ -120,6 +120,12 @@ int getFramegenState();
 /// zero after the first frame and retireWaitNs stays near zero in the steady state.
 void getGpuSyncStats(uint64_t *syncFrames, uint64_t *fallbacks, int64_t *retireWaitNs);
 
+/// How long the capture thread waited for the render loop's queue mutex, summed over the
+/// session, with the worst single wait and the number of delivered captures. Non-trivial
+/// numbers here mean capture delivery is being throttled by the render loop rather than by
+/// the source, which caps real_fps and therefore everything downstream of it.
+void getCaptureLockStats(int64_t *totalNs, int64_t *maxNs, uint64_t *samples);
+
 uint64_t getGeneratedFrameCount();
 
 // Total frames actually posted to the overlay surface (CPU blit or WSI

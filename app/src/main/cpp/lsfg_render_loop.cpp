@@ -84,6 +84,21 @@ struct State {
     using Clock = std::chrono::steady_clock;
 
     std::mutex mu;
+    // Guards the swapchain, its surface and the output window — everything the
+    // WSI blit touches. Deliberately NOT `mu`.
+    //
+    // `mu` guards the pending-capture queue, and the capture thread takes it on
+    // every delivered frame. When the swapchain blit also held `mu`, the capture
+    // callback blocked for the whole of vkAcquireNextImageKHR + the ring fence
+    // wait + vkQueuePresentKHR, several times per capture interval — so the
+    // ImageReader was not being drained while the display was being fed, and the
+    // VirtualDisplay dropped frames at the source. The two have nothing in common
+    // beyond having been written at the same time.
+    //
+    // Lock order where both are needed (setOutputSurface, shutdown): `mu` first,
+    // then `swapMu`. blitOutputToWindow takes only `swapMu`, so it can never
+    // invert the order.
+    std::mutex swapMu;
     bool initialized = false;
     bool performanceMode = false;
     bool framegenInitOk = false;  // tracks whether LSFG_3_1::initialize succeeded
@@ -336,6 +351,13 @@ struct State {
     std::atomic<uint64_t> gpuSyncFallbacks{0};// presents that fell back to waitIdle
     std::atomic<int64_t> gpuSyncRetireWaitNs{0};  // CPU time in the deferred input wait
     std::atomic<bool> gpuSyncLoggedFallback{false};
+    // How long the capture thread spends waiting for `mu` in pushFrame. The
+    // point of the split above is to drive this to zero; measuring it is how we
+    // tell whether that was actually what capped capture delivery, rather than
+    // assuming it.
+    std::atomic<int64_t> captureLockWaitNs{0};
+    std::atomic<int64_t> captureLockWaitMaxNs{0};
+    std::atomic<uint64_t> captureLockSamples{0};
     // Reused every frame. A SYNC_FD import is always temporary, so each
     // semaphore reverts to its (unsignalled) permanent payload as soon as the
     // wait completes and can be imported into again next frame.
@@ -1036,7 +1058,7 @@ bool createSwapchain() {
 // path: the submit is queued immediately and the GPU stalls on the fence, so
 // the CPU is free to pace and issue the next blit meanwhile.
 bool blitOutputToSwapchain(const AhbImage &src, VkSemaphore gpuWait = VK_NULL_HANDLE) {
-    // Note: Called with g.mu held from blitOutputToWindow.
+    // Note: Called with g.swapMu held from blitOutputToWindow.
     if (g.swap.swapchain == VK_NULL_HANDLE) return false;
     if (src.image == VK_NULL_HANDLE) return false;
     if (g.swap.outOfDate) {
@@ -1919,7 +1941,7 @@ void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true,
     const bool cpuPostActive = g.npuPostProcessing || g.cpuPostProcessing;
     if (kEnableWsiSwapchain && !cpuPostActive && g.vk.hasSwapchain
             && !g.swap.disabledForSession) {
-        std::lock_guard<std::mutex> lock(g.mu);
+        std::lock_guard<std::mutex> lock(g.swapMu);
         if (g.swap.swapchain == VK_NULL_HANDLE) {
             if (!createSwapchain()) {
                 // Mark disabled so subsequent blits don't spin on the
@@ -2801,6 +2823,9 @@ int initRenderLoop(const char *cacheDir, const RenderLoopConfig &cfg) {
     g.gpuSyncFrames.store(0, std::memory_order_relaxed);
     g.gpuSyncFallbacks.store(0, std::memory_order_relaxed);
     g.gpuSyncRetireWaitNs.store(0, std::memory_order_relaxed);
+    g.captureLockWaitNs.store(0, std::memory_order_relaxed);
+    g.captureLockWaitMaxNs.store(0, std::memory_order_relaxed);
+    g.captureLockSamples.store(0, std::memory_order_relaxed);
 
     int rc = create_session(g.vk);
     if (rc != kOk) {
@@ -2875,7 +2900,11 @@ int initRenderLoop(const char *cacheDir, const RenderLoopConfig &cfg) {
 }
 
 void setOutputSurface(ANativeWindow *win, uint32_t w, uint32_t h) {
+    // Reads g.initialized and the post-process flags (mu) and rebuilds the
+    // swapchain (swapMu), so it needs both. Rare enough that the double lock
+    // costs nothing.
     std::lock_guard<std::mutex> lock(g.mu);
+    std::lock_guard<std::mutex> swapLock(g.swapMu);
     // Always tear down any prior swapchain first — it holds a VkSurfaceKHR
     // which holds an ANativeWindow reference, and the spec requires the
     // surface outlive the swapchain but be destroyed before the window.
@@ -2978,7 +3007,18 @@ void pushFrame(AHardwareBuffer *ahb, int64_t timestampNs) {
 
     AHardwareBuffer_acquire(ahb);
     {
+        const auto lockWaitStart = State::Clock::now();
         std::lock_guard<std::mutex> lock(g.mu);
+        {
+            const int64_t waitedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                State::Clock::now() - lockWaitStart).count();
+            g.captureLockWaitNs.fetch_add(waitedNs, std::memory_order_relaxed);
+            g.captureLockSamples.fetch_add(1, std::memory_order_relaxed);
+            int64_t prevMax = g.captureLockWaitMaxNs.load(std::memory_order_relaxed);
+            while (waitedNs > prevMax &&
+                   !g.captureLockWaitMaxNs.compare_exchange_weak(
+                       prevMax, waitedNs, std::memory_order_relaxed)) {}
+        }
         if (!g.initialized) {
             AHardwareBuffer_release(ahb);
             return;
@@ -3017,6 +3057,7 @@ void shutdownRenderLoop() {
 
     {
         std::lock_guard<std::mutex> lock(g.mu);
+        std::lock_guard<std::mutex> swapLock(g.swapMu);
         for (const auto &pendingFrame : g.pending) AHardwareBuffer_release(pendingFrame.ahb);
         g.pending.clear();
 
@@ -3084,6 +3125,12 @@ void shutdownRenderLoop() {
 void getImportCacheStats(uint64_t *hits, uint64_t *misses) {
     if (hits != nullptr) *hits = g.cacheHitsTotal.load(std::memory_order_relaxed);
     if (misses != nullptr) *misses = g.cacheMissesTotal.load(std::memory_order_relaxed);
+}
+
+void getCaptureLockStats(int64_t *totalNs, int64_t *maxNs, uint64_t *samples) {
+    if (totalNs != nullptr) *totalNs = g.captureLockWaitNs.load(std::memory_order_relaxed);
+    if (maxNs != nullptr) *maxNs = g.captureLockWaitMaxNs.load(std::memory_order_relaxed);
+    if (samples != nullptr) *samples = g.captureLockSamples.load(std::memory_order_relaxed);
 }
 
 void getGpuSyncStats(uint64_t *syncFrames, uint64_t *fallbacks, int64_t *retireWaitNs) {
